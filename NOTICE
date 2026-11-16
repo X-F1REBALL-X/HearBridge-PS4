@@ -5,3 +5,9 @@ Licensed under GPL-3.0-or-later (see LICENSE).
 The package built from this source also contains libc.prx, libSceFios2.prx and right.sprx.
 They come from the OpenOrbis PS4 toolchain at build time, are not part of this
 repository and are not covered by the license above.
+
+The bundled Realtek USB Bluetooth firmware blobs under assets/firmware/
+(rtl8761bu_fw.bin and rtl8761bu_config.bin) come from the linux-firmware
+rtl_bt tree (Realtek Semiconductor Corporation) and are redistributed
+under assets/firmware/LICENCE.rtlwifi_firmware.txt. They are not covered
+by this project's GPL-3.0-or-later license.

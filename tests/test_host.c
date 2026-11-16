@@ -446,7 +446,7 @@ static void test_launcher_addr(void)
     CHECK(strstr(t, "http://192.0.2.10:8090") && strstr(t, "127.0.0.1:8090") && t[0] == 'H');
     CHECK(strstr(t, "Press X to open the page in the PS4 web browser.\nPress Circle to close, HearBridge keeps running."));
     CHECK(strstr(t, "Yes") == NULL && strstr(t, "No closes") == NULL);
-    CHECK(strstr(t, "\nA Bluetooth USB dongle (CSR8510) must be plugged into the PS4.\n") != NULL && strlen(t) < 450);
+    CHECK(strstr(t, "\nA CSR8510 or Realtek RTL8761BU USB dongle must be plugged into the PS4.\n") != NULL && strlen(t) < 450);
     CHECK(strstr(t, "First press OK. Then:\nPress X to open") != NULL);       /* the pad is blind while the message is up */
     CHECK(strncmp(t, "HearBridge 1.0.0 is running.\n", 29) == 0);                 /* version in the first line */
     CHECK(strstr(t, "Developed by") == NULL && strstr(t, "F1REBALL") == NULL);   /* the name is on the splash only */

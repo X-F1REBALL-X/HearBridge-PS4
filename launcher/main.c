@@ -42,7 +42,7 @@
 #include "install.h"
 
 #ifndef LAUNCHER_VERSION
-#define LAUNCHER_VERSION "1.0.0"
+#define LAUNCHER_VERSION "1.1.0"
 #endif
 #ifndef DAEMON_VERSION
 #define DAEMON_VERSION "0.0.0"

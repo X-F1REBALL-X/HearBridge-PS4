@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* hearbridge_ps4 - HearBridge PS4 daemon (see PROBE_VERSION).
  *
- * Drives a CSR8510 USB Bluetooth adapter (0A12:0001) through libSceUsbd,
+ * Drives a USB Bluetooth adapter (CSR8510 0A12:0001, or Realtek RTL8761BU
+ * and its rebadges) through libSceUsbd. Realtek sticks that boot in ROM
+ * mode get their patch uploaded the same way HearBridge PS5 does. Then it
  * keeps an A2DP Source stream open to a headset, and encodes PCM received
  * over UDP 127.0.0.1:9500 (48 kHz stereo s16le) to SBC. Silence is sent
  * when no PCM arrives. Link keys are persisted under /data/hearbridge/.
@@ -47,8 +49,12 @@
 #include "ui.h"
 #include "avrcp.h"
 #include "pager.h"
+#include "hci.h"
+#include "btchip.h"
+#include "realtek_fw.h"
+#include "host_bdaddr.h"
 
-#define PROBE_VERSION "1.0.0"
+#define PROBE_VERSION "1.1.0"
 #define LOG_PATH      "/data/hearbridge/daemon.log"
 #define LOG_PATH_ALT  "/user/data/hearbridge/daemon.log"
 #define TARGET_PATH   "/data/hearbridge_target.txt"
@@ -56,8 +62,10 @@
 #define STATE_PATH    "/data/hearbridge/state"
 #define STATE_PATH_ALT "/user/data/hearbridge/state"
 
-#define TARGET_VID 0x0A12
-#define TARGET_PID 0x0001
+#define CSR_VID 0x0A12
+#define CSR_PID 0x0001
+#define OP_SET_EVENT_FILTER   0x0C05
+#define OP_READ_LOCAL_FEATURES 0x1003
 
 
 #define POLL_MS          20      /* per endpoint read inside the pump */
@@ -948,6 +956,86 @@ static struct {
     void *thr;
 } EVT;
 
+/* Raw HCI events for hci_cmd_sync() (Realtek prepare and shared BD_ADDR).
+ * on_event() still runs; this is an extra copy while capture is on. */
+#define HCI_CAP_MAX 8
+static unsigned char g_cap_ev[HCI_CAP_MAX][HCI_PKT_MAX];
+static int g_cap_len[HCI_CAP_MAX];
+static int g_cap_n, g_cap_rd, g_cap_on;
+static void cap_push(const unsigned char *ev, int n)
+{
+    int i;
+    if (!g_cap_on || n < 2 || n > HCI_PKT_MAX) return;
+    if (g_cap_n >= HCI_CAP_MAX) return;
+    i = g_cap_n++;
+    memcpy(g_cap_ev[i], ev, (size_t)n);
+    g_cap_len[i] = n;
+}
+
+static int hci_wrap_cmd(void *self, unsigned op, const void *args, int nargs)
+{
+    (void)self;
+    return hci_send(op, args, nargs);
+}
+
+static int hci_wrap_pump(void *self, int wait_ms)
+{
+    long deadline = now_ms() + (wait_ms > 0 ? wait_ms : 0);
+    (void)self;
+    if (wait_ms <= 0) {
+        pump_once();
+        return g_cap_rd < g_cap_n;
+    }
+    while (now_ms() < deadline && !G.transport_dead) {
+        if (g_cap_rd < g_cap_n) return 1;
+        pump_once();
+    }
+    if (g_cap_rd < g_cap_n) return 1;
+    return G.transport_dead ? -1 : 0;
+}
+
+static int hci_wrap_next_event(void *self, unsigned char *dst, int cap)
+{
+    int n;
+    (void)self;
+    if (g_cap_rd >= g_cap_n) return 0;
+    n = g_cap_len[g_cap_rd];
+    if (n > cap) n = cap;
+    if (n > 0) memcpy(dst, g_cap_ev[g_cap_rd], (size_t)n);
+    g_cap_rd++;
+    if (g_cap_rd >= g_cap_n) g_cap_rd = g_cap_n = 0;
+    return n;
+}
+
+static int hci_wrap_next_acl(void *self, unsigned char *dst, int cap)
+{
+    (void)self; (void)dst; (void)cap;
+    return 0;
+}
+
+static const hci_ops g_hci_ops = {
+    .next_acl = hci_wrap_next_acl,
+    .next_event = hci_wrap_next_event,
+    .pump = hci_wrap_pump,
+    .cmd = hci_wrap_cmd,
+};
+
+static hci_t hci_live(void)
+{
+    hci_t h;
+    g_cap_rd = g_cap_n = 0;
+    g_cap_on = 1;
+    h.ctx = &H;
+    h.ops = &g_hci_ops;
+    return h;
+}
+
+static void hci_live_done(void)
+{
+    g_cap_on = 0;
+    g_cap_rd = g_cap_n = 0;
+}
+
 static void *evt_main(void *arg)
 {
     unsigned char buf[512];
@@ -1786,6 +1874,7 @@ static void on_event(const unsigned char *ev, int n)
     char astr[18];
 
     if (n < 2) return;
+    if (g_cap_on) cap_push(ev, n);
     if (ev[0] != 0x13) hexline("hci evt", ev, n);
 
     /* Command Complete (0x0E) */
@@ -2610,25 +2699,95 @@ static int load_target_override(unsigned char addr_out[6])
     return 1;
 }
 
+static int usb_vid_known(unsigned vid, unsigned pid)
+{
+    if (vid == CSR_VID && pid == CSR_PID) return 1; /* CSR8510 */
+    if (vid == 0x0bda) return 1;                    /* Realtek, incl. 8771 / B00C */
+    if (vid == 0x37ad || vid == 0x2357) return 1;   /* TP-Link (often RTL8761BU) */
+    if (vid == 0x0b05) return 1;                    /* ASUS (BT600 and similar) */
+    return 0;
+}
+
+static int usb_is_bt_hci_class(unsigned cls, unsigned sub, unsigned proto)
+{
+    (void)proto;
+    return cls == 0xE0 && sub == 0x01;
+}
+
+static int usb_stick_ok(const struct usb_dev_desc *d)
+{
+    if (!d) return 0;
+    if (usb_vid_known(d->idVendor, d->idProduct)) return 1;
+    return usb_is_bt_hci_class(d->bDeviceClass, d->bDeviceSubClass, d->bDeviceProtocol);
+}
+
+/* Proven CSR8510 mask from the original PS4 bring-up (no Extended Inquiry Result). */
+static const unsigned char g_evmask_csr[8] = {
+    0xFF, 0xFF, 0xFB, 0xFF, 0x07, 0xF8, 0xBF, 0x3D
+};
+/* Wider mask so mode-2 (EIR) result events arrive on Realtek and other sticks. */
+static const unsigned char g_evmask_wide[8] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF, 0x7D
+};
+
 static int setup_controller(void)
 {
     unsigned char r[64], p[248];
-    int n = 0;
-    char astr[18];
+    int n = 0, family = HB_BT_FAMILY_OTHER;
+    char why[192], astr[18];
+    const unsigned char *mask;
+    int is_csr, is_rtl;
+    hci_t hci;
 
     if (!hci_cmd_cc(OP_RESET, NULL, 0, r, sizeof r, &n) || r[0]) {
         say("FAIL: HCI Reset status 0x%02x", n > 0 ? r[0] : 0xFF);
         return 0;
     }
     say("HCI Reset: ok");
+    /* Give a ROM-mode Realtek time to be ready. Harmless on CSR. */
+    sceKernelUsleep(250 * 1000);
+
+    hci = hci_live();
+    if (!hb_rtl_prepare(hci, &family, why, (int)sizeof why)) {
+        hci_live_done();
+        say("FAIL: Realtek firmware: %s", why[0] ? why : "upload failed");
+        return 0;
+    }
+    is_csr = family == HB_BT_FAMILY_CSR;
+    is_rtl = family == HB_BT_FAMILY_REALTEK;
+    mask = is_csr ? g_evmask_csr : g_evmask_wide;
+    hci_live_done();
+
+    /* Event mask before inquiry mode. CSR keeps the proven PS4 mask. */
+    if (!hci_cmd_cc(OP_SET_EVENT_MASK, mask, 8, r, sizeof r, &n) || r[0])
+        out("Set_Event_Mask failed (continuing)");
+    else
+        out("Set_Event_Mask: %s", is_csr ? "CSR/PS4 0x3DBFF807FFFBFFFF" : "EIR 0x7DBFFFFFFFFFFFFF");
+
+    if (!is_csr) {
+        unsigned char filt = 0;
+        if (!hci_cmd_cc(OP_SET_EVENT_FILTER, &filt, 1, r, sizeof r, &n) || r[0])
+            out("Set_Event_Filter clear failed (continuing)");
+    }
+
+    /* Shared host address so a headset paired on one stick reconnects on the other.
+     * CSR PSKEY is saved without a warm reset (that dropped the USB pipe on PS5);
+     * Realtek gets the address in the firmware config. */
+    hci = hci_live();
+    hb_host_bdaddr_sync_usb(hci, is_csr, is_rtl);
+    hci_live_done();
 
     if (!hci_cmd_cc(OP_READ_BD_ADDR, NULL, 0, r, sizeof r, &n) || n < 7 || r[0]) {
-        say("FAIL: Read BD_ADDR");
+        say("FAIL: adapter USB went away after BD_ADDR sync");
         return 0;
     }
     memcpy(G.local_addr, r + 1, 6);
     addr_str(G.local_addr, astr);
     say("BD_ADDR: %s", astr);
+
+    /* Realtek firmware Reset clears the event mask; put it back. */
+    if (!hci_cmd_cc(OP_SET_EVENT_MASK, mask, 8, r, sizeof r, &n) || r[0])
+        out("Set_Event_Mask after BD_ADDR sync failed (continuing)");
 
     if (!hci_cmd_cc(OP_READ_LOCAL_VER, NULL, 0, r, sizeof r, &n) || n < 9 || r[0]) {
         say("FAIL: Read Local Version");
@@ -2637,9 +2796,21 @@ static int setup_controller(void)
     {
         unsigned hci_rev = (unsigned)(r[2] | (r[3] << 8));
         unsigned manuf = (unsigned)(r[5] | (r[6] << 8));
-        say("HCI %s rev 0x%04x, LMP %s, manuf 0x%04x%s",
+        const char *fam = btchip_family_name(family);
+        say("HCI %s rev 0x%04x, LMP %s, manuf 0x%04x%s%s%s",
             hci_ver_name(r[1]), hci_rev, hci_ver_name(r[4]), manuf,
-            manuf == 0x000A ? " (CSR)" : "");
+            manuf == 0x000A ? " (CSR)" : "",
+            fam && fam[0] ? " family " : "",
+            fam && fam[0] ? fam : "");
+    }
+
+    /* A Low Energy only stick cannot do A2DP. Features byte 4 bit 5:
+     * BR/EDR not supported. hci_cmd_cc return starts at the status byte. */
+    if (hci_cmd_cc(OP_READ_LOCAL_FEATURES, NULL, 0, r, sizeof r, &n) && n >= 9 && r[0] == 0) {
+        if (r[5] & 0x20) {
+            say("FAIL: this adapter has no Bluetooth Classic (BR/EDR); audio needs it");
+            return 0;
+        }
     }
 
     /* Return params: status, ACL_Data_Packet_Length(2), SCO_Data_Packet_Length(1),
@@ -2656,28 +2827,19 @@ static int setup_controller(void)
         out("Read_Buffer_Size failed, assuming MTU 1021 / 7 packets");
     }
 
-    /* Enable a broad event mask so Inquiry/SSP/auth events are delivered. */
-    {
-        unsigned char mask[8] = {
-            0xFF, 0xFF, 0xFB, 0xFF, 0x07, 0xF8, 0xBF, 0x3D
-        };
-        if (!hci_cmd_cc(OP_SET_EVENT_MASK, mask, 8, r, sizeof r, &n) || r[0])
-            out("Set_Event_Mask failed (continuing)");
-        else
-            out("Set_Event_Mask: ok");
-    }
-
     p[0] = 1; /* SSP enabled */
     if (!hci_cmd_cc(OP_WRITE_SSP_MODE, p, 1, r, sizeof r, &n) || r[0])
         out("Write_Simple_Pairing_Mode failed (continuing)");
     else
         out("Write_Simple_Pairing_Mode: enabled");
 
-    p[0] = 1; /* Inquiry Result with RSSI */
+    /* CSR: inquiry mode 1 (RSSI results). Realtek and others: mode 2 (EIR).
+     * Mode 2 is accepted by some CSR clones that then emit no results. */
+    p[0] = is_csr ? 1 : 2;
     if (!hci_cmd_cc(OP_WRITE_INQUIRY_MODE, p, 1, r, sizeof r, &n) || r[0])
         out("Write_Inquiry_Mode failed (continuing with standard results)");
     else
-        out("Write_Inquiry_Mode: RSSI");
+        out("Write_Inquiry_Mode: %s", is_csr ? "RSSI (CSR/PS4)" : "EIR");
 
     put16(p, PAGE_TIMEOUT);
     if (!hci_cmd_cc(OP_WRITE_PAGE_TIMEOUT, p, 2, r, sizeof r, &n) || r[0])
@@ -3857,9 +4019,14 @@ static int session(void)
 {
     usb_dev **list = NULL, *target = NULL;
     int count, i, rc, detached = 0, claimed = 0, stopped = 0, idle = 0, torn = 0, repeat;
+    unsigned tvid = 0, tpid = 0;
+    char seen[96];
+    char usb_n[96];
     struct dev *pick;
     struct saved_dev last_after_scan;
 
+    seen[0] = 0;
+    usb_n[0] = 0;
     memset(&G, 0, sizeof G);
     memset(&AV, 0, sizeof AV);
     avrcp_init(&AVR, g_hs_vol >= 0 ? g_hs_vol : 127);
@@ -3887,24 +4054,60 @@ static int session(void)
         struct usb_dev_desc d;
         memset(&d, 0, sizeof d);
         rc = U.GetDeviceDescriptor(list[i], &d);
+        if (rc >= 0) {
+            if (!usb_n[0])
+                snprintf(usb_n, sizeof usb_n, "%04X:%04X", d.idVendor, d.idProduct);
+            else if (strlen(usb_n) < sizeof usb_n - 12) {
+                char one[12];
+                snprintf(one, sizeof one, ", %04X:%04X", d.idVendor, d.idProduct);
+                strncat(usb_n, one, sizeof usb_n - strlen(usb_n) - 1);
+            }
+        }
         if (!repeat)
-            out("  [%d] bus %d addr %d  %04X:%04X class %02x  (desc rc %d)", i,
+            out("  [%d] bus %d addr %d  %04X:%04X class %02x/%02x/%02x  (desc rc %d)%s", i,
                 U.GetBusNumber ? U.GetBusNumber(list[i]) : -1,
                 U.GetDeviceAddress ? U.GetDeviceAddress(list[i]) : -1,
-                d.idVendor, d.idProduct, d.bDeviceClass, rc);
-        if (rc >= 0 && d.idVendor == TARGET_VID && d.idProduct == TARGET_PID && !target)
-            target = list[i];
+                d.idVendor, d.idProduct, d.bDeviceClass, d.bDeviceSubClass, d.bDeviceProtocol, rc,
+                (rc >= 0 && usb_stick_ok(&d)) ? "  [bt]" : "");
+        if (rc >= 0 && usb_stick_ok(&d)) {
+            if (!seen[0])
+                snprintf(seen, sizeof seen, "%04X:%04X", d.idVendor, d.idProduct);
+            else if (strlen(seen) < sizeof seen - 12) {
+                char one[12];
+                snprintf(one, sizeof one, ", %04X:%04X", d.idVendor, d.idProduct);
+                strncat(seen, one, sizeof seen - strlen(seen) - 1);
+            }
+            if (!target) {
+                target = list[i];
+                tvid = d.idVendor;
+                tpid = d.idProduct;
+            }
+        }
     }
 
     if (!target) {
-        if (!repeat) say("FAIL: adapter 0A12:0001 not found (%d USB devices seen)", count);
-        set_state("no_adapter", "HearBridge: Bluetooth adapter not found", 1);
+        if (!repeat) {
+            if (usb_n[0])
+                say("FAIL: no CSR8510 (0A12:0001) or Realtek RTL8761BU dongle (%d USB devices seen: %s)",
+                    count, usb_n);
+            else
+                say("FAIL: no CSR8510 (0A12:0001) or Realtek RTL8761BU dongle (%d USB devices seen)",
+                    count);
+        }
+        set_state("no_adapter",
+                  "HearBridge: plug in a CSR8510 or Realtek RTL8761BU USB dongle", 1);
         g_no_adapter++;
         goto finish;
     }
-    if (repeat) out("daemon: adapter 0A12:0001 is there again");
+    if (repeat) out("daemon: Bluetooth dongle %04X:%04X is there again", tvid, tpid);
     g_no_adapter = 0;
-    say("Found adapter 0A12:0001");
+    {
+        char label[64];
+        btchip_describe((int)tvid, (int)tpid, label, (int)sizeof label);
+        say("Found adapter %s", label[0] ? label : "USB HCI");
+        if (seen[0] && strchr(seen, ','))
+            out("daemon: other Bluetooth USB candidates: %s (using %04X:%04X)", seen, tvid, tpid);
+    }
     set_state("init", NULL, 0);
 
     rc = U.Open(target, &H);
@@ -4152,6 +4355,7 @@ int main(void)
     }
     out("HearBridge PS4 daemon %s", PROBE_VERSION);
     if (!g_log) out("warning: could not open %s for writing", LOG_PATH);
+    hb_rtl_ensure_firmware();
 
     notify_now("HearBridge PS4 %s", PROBE_VERSION);
     snprintf(g_notif_last, sizeof g_notif_last, "HearBridge PS4 %s", PROBE_VERSION);

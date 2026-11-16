@@ -51,13 +51,13 @@ static inline void hb_ui_text(char *out, size_t n, const char *note, const char 
     if (k >= n) return;
     if (hb_ip_ok(ip))
         snprintf(out + k, n - k,
-                 "HearBridge %s is running.\nA Bluetooth USB dongle (CSR8510) must be plugged into the PS4.\n\nOpen http://%s:%d on a phone or PC on the same network.\n"
+                 "HearBridge %s is running.\nA CSR8510 or Realtek RTL8761BU USB dongle must be plugged into the PS4.\n\nOpen http://%s:%d on a phone or PC on the same network.\n"
                  "On the PS4 itself use the web browser at http://127.0.0.1:%d.\n\n"
                  "First press OK. Then:\nPress %s to open the page in the PS4 web browser.\nPress %s to close, HearBridge keeps running.",
                  ver, ip, port, port, open_l, close_l);
     else
         snprintf(out + k, n - k,
-                 "HearBridge %s is running.\nA Bluetooth USB dongle (CSR8510) must be plugged into the PS4.\n\nOpen http://<console address>:%d on a phone or PC on the same "
+                 "HearBridge %s is running.\nA CSR8510 or Realtek RTL8761BU USB dongle must be plugged into the PS4.\n\nOpen http://<console address>:%d on a phone or PC on the same "
                  "network (the address is in the HearBridge notification).\n"
                  "On the PS4 itself use the web browser at http://127.0.0.1:%d.\n\n"
                  "First press OK. Then:\nPress %s to open the page in the PS4 web browser.\nPress %s to close, HearBridge keeps running.",

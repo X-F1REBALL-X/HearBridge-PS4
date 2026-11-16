@@ -32,8 +32,8 @@ export BUILD_ID
 OUT   := build
 NAME  := hearbridge_ps4
 
-DAEMON_SRC := src/probe.c src/sdp_server.c src/sbc_enc.c src/linkkeys.c src/pcm_udp.c src/devices.c src/webui.c src/avrcp.c src/eq.c
-DAEMON_HDR := src/sdp_server.h src/sbc_enc.h src/linkkeys.h src/pcm_udp.h src/devices.h src/ui.h src/webui_html.h src/webui_assets.h src/avrcp.h src/log.h src/cmdq.h src/hciframe.h src/cod.h src/resample.h src/boost.h src/eq.h src/gprof.h
+DAEMON_SRC := src/probe.c src/sdp_server.c src/sbc_enc.c src/linkkeys.c src/pcm_udp.c src/devices.c src/webui.c src/avrcp.c src/eq.c src/btchip.c src/realtek_fw.c src/hci_cmd_sync.c src/host_bdaddr.c
+DAEMON_HDR := src/sdp_server.h src/sbc_enc.h src/linkkeys.h src/pcm_udp.h src/devices.h src/ui.h src/webui_html.h src/webui_assets.h src/avrcp.h src/log.h src/cmdq.h src/hciframe.h src/cod.h src/resample.h src/boost.h src/eq.h src/gprof.h src/hci.h src/hci_cmd.h src/btchip.h src/realtek_fw.h src/host_bdaddr.h src/util.h src/rtl_fw_blobs.h
 
 PAYLOAD_CFLAGS := -O2 -Wall -Wextra -DHEARBRIDGE_PAYLOAD=1 -DHB_BUILD='"$(BUILD_ID)"' -I src
 ORBIS_CC := $(PS4_PAYLOAD_SDK)/bin/orbis-clang
@@ -108,10 +108,19 @@ clean:
 	$(MAKE) -C plugin clean
 	rm -f src/shell_audio_tap_prx.h src/shell_tap_test_prx.h
 
+# Embed Realtek USB firmware blobs from assets/firmware into src/rtl_fw_blobs.h.
+.PHONY: rtl-fw
+rtl-fw:
+	python3 scripts/gen_rtl_fw.py src/rtl_fw_blobs.h
+
+src/rtl_fw_blobs.h: assets/firmware/rtl8761bu_fw.bin assets/firmware/rtl8761bu_config.bin scripts/gen_rtl_fw.py
+	python3 scripts/gen_rtl_fw.py src/rtl_fw_blobs.h
+
 # Host tests of the pure parts (no SDK needed).
-test: $(OUT)/test_host $(OUT)/test_webui
+test: $(OUT)/test_host $(OUT)/test_webui $(OUT)/test_realtek_fw
 	$(OUT)/test_host
 	$(OUT)/test_webui
+	$(OUT)/test_realtek_fw $(OUT)/rtl_fw_out
 
 $(OUT)/test_host: tests/test_host.c src/cod.h src/resample.h src/pager.h src/boost.h src/eq.h src/eq.c src/gprof.h launcher/addr.h | $(OUT)
 	gcc -O2 -Wall -Wextra -o $@ tests/test_host.c src/eq.c -lm
@@ -122,3 +131,7 @@ $(OUT)/test_webui: tests/test_webui.c src/webui.c src/webui_html.h src/webui_ass
 	gcc -O2 -Wall -Wextra -Wno-format-truncation -Dsin_len=sin_port -DSETTINGS_PATH='"/tmp/hbt/settings.txt"' -DHB_GAMES_PATH='"/tmp/hbt/games.txt"' \
 	    -DTAP_OFF_PATH='"/tmp/hbt/tap_off"' -DSKIP_PATH='"/tmp/hbt/skip.txt"' -I src \
 	    -o $@ tests/test_webui.c src/eq.c src/devices.c src/linkkeys.c -lm
+
+$(OUT)/test_realtek_fw: tests/test_realtek_fw.c tests/log_stub.c src/realtek_fw.c src/hci_cmd_sync.c src/btchip.c src/host_bdaddr.c src/realtek_fw.h src/hci.h src/hci_cmd.h src/btchip.h src/host_bdaddr.h src/util.h src/rtl_fw_blobs.h | $(OUT)
+	gcc -O2 -Wall -Wextra -std=c11 -D_DEFAULT_SOURCE -I src \
+	    -o $@ tests/test_realtek_fw.c tests/log_stub.c src/realtek_fw.c src/hci_cmd_sync.c src/btchip.c src/host_bdaddr.c

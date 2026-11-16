@@ -85,7 +85,7 @@ static struct {
     int volume;                /* boost percent 0..HB_LOUD_MAX (boost.h) */
     int hs_avail, hs_vol, hs_req;   /* headphone volume (AVRCP): available, level 0..127, page request+1 */
     uint64_t stream_t0;        /* process time (us) when streaming began */
-    char error[96];            /* last FAIL line of the daemon, cleared at streaming */
+    char error[192];           /* last FAIL line of the daemon, cleared at streaming */
     unsigned long pcm_rx;            /* PCM packets from the tap this stream */
     long pcm_idle_s;
     char tap_title[16];

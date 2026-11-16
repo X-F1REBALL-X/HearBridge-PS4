@@ -5,10 +5,10 @@
 # copied from that toolchain at build time; they are not part of this repository.
 
 TITLE       ?= HearBridge
-VERSION     := 1.0.0
+VERSION     := 1.1.0
 # param.sfo wants "xx.yy" (two digits each side) for APP_VER; VERSION (master
 # version) of a full app is 01.00.
-APP_VER     := 01.00
+APP_VER     := 01.01
 TITLE_ID    ?= HRBG40001
 CONTENT_ID  ?= IV0000-HRBG40001_00-HEARBRIDGEPS4000
 CATEGORY    ?= gd

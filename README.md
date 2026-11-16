@@ -11,7 +11,7 @@ Developed by **X-F1REBALL-X**
 **HearBridge family:** [PS5](https://github.com/X-F1REBALL-X/HearBridge-PS5) · [PS4](https://github.com/X-F1REBALL-X/HearBridge-PS4) · [Browser](https://github.com/X-F1REBALL-X/HearBridge-Browser)
 
 
-HearBridge PS4 plays your PS4's game audio on ordinary Bluetooth headphones, earbuds or speakers. The console cannot do this by itself, so HearBridge drives a small USB Bluetooth dongle (CSR8510) and streams to any A2DP headset. You control everything from a web page served by the console, on a phone, a PC or the PS4 browser. It is the first Bluetooth audio solution for the PS4.
+HearBridge PS4 plays your PS4's game audio on ordinary Bluetooth headphones, earbuds or speakers. The console cannot do this by itself, so HearBridge drives a small USB Bluetooth dongle (CSR8510 or Realtek RTL8761BU) and streams to any A2DP headset. You control everything from a web page served by the console, on a phone, a PC or the PS4 browser. It is the first Bluetooth audio solution for the PS4.
 
 <img src="docs/img/showcase.png" alt="HearBridge PS4 on a phone and in a desktop browser: devices, sound, equalizer and game profiles" width="100%">
 
@@ -27,10 +27,12 @@ HearBridge PS4 plays your PS4's game audio on ordinary Bluetooth headphones, ear
 
 ## Requirements
 
-<img align="right" src="docs/dongle.png" alt="A small CSR8510 USB Bluetooth dongle" width="220">
+<img align="right" src="docs/dongle.png" alt="A small USB Bluetooth dongle" width="220">
 
 - A jailbroken PS4 running GoldHEN, with the BinLoader server and Plugin Loader switched on.
-- A USB Bluetooth dongle with the CSR8510 chip (USB ID 0A12:0001), plugged into the PS4. It looks like the one on the right.
+- A USB Bluetooth dongle plugged into the PS4, either:
+  - **CSR8510** (USB ID `0A12:0001`). It looks like the one on the right. No extra firmware is needed.
+  - **Realtek RTL8761BU**, including rebadged sticks such as TP-Link UB500 / UB600 (`0BDA:B00C` / `0BDA:8771`) and ASUS BT600. The chip is detected from the stick itself, not only the USB id. Firmware is bundled in the package and written to `/data/hearbridge/firmware/` on start.
 - Bluetooth headphones, earbuds or a speaker.
 
 <br clear="right">
@@ -54,7 +56,7 @@ Right after the first install you can already open the tile, pair your earbuds a
 
 ## Your controller stays connected
 
-HearBridge does not affect your controller. The Bluetooth audio goes through the separate USB dongle, and HearBridge never touches the console's built-in Bluetooth chip, so your controllers stay connected as usual.
+HearBridge does not affect your controller. The Bluetooth audio goes through the separate USB dongle, and HearBridge never touches the console's built-in Bluetooth chip, so your controllers stay connected as usual. Pairing is shared across CSR and Realtek sticks: a headset paired on one should reconnect on the other (a CSR stick may need one unplug/replug after the first time the shared address is saved).
 
 ## Good to know
 
@@ -86,7 +88,9 @@ The package also contains three system modules (`libc.prx`, `libSceFios2.prx` an
 
 ## Credits
 
-Developed by **X-F1REBALL-X**. The equalizer comes from [HearBridge PS5](https://github.com/X-F1REBALL-X/HearBridge-PS5). Built with the OpenOrbis PS4 toolchain, the PS4 payload SDK and the GoldHEN plugins SDK. The system modules in the package belong to the OpenOrbis toolchain and are not covered by this project's license.
+Developed by **X-F1REBALL-X**. The equalizer comes from [HearBridge PS5](https://github.com/X-F1REBALL-X/HearBridge-PS5). The Realtek ROM-mode firmware loader, chip identity tables and bundled RTL8761BU blobs were ported from HearBridge PS5 (USB path and Realtek detection by [jamesst20](https://github.com/jamesst20)).
+
+Bundled RTL8761BU firmware blobs are from the [linux-firmware](https://git.kernel.org/pub/scm/linux/kernel/git/firmware/linux-firmware.git/tree/rtl_bt) `rtl_bt` tree (Realtek Semiconductor Corporation). See [assets/firmware/LICENCE.rtlwifi_firmware.txt](assets/firmware/LICENCE.rtlwifi_firmware.txt). Built with the OpenOrbis PS4 toolchain, the PS4 payload SDK and the GoldHEN plugins SDK. The system modules in the package belong to the OpenOrbis toolchain and are not covered by this project's license.
 
 Big thanks to SiSTR0 for creating GoldHEN. HearBridge would not be possible without it.
 

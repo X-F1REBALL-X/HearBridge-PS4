@@ -230,7 +230,7 @@ body[data-tab=log] .foot .sub#ver2{display:block;margin-top:14px}
 <body data-tab="home">
 <div class="hdr">
   <div class="logo">HEAR<b>BRIDGE</b> PS4</div>
-  <div class="sub" id="ver">Bluetooth audio for PS4 &middot; USB dongle</div>
+  <div class="sub" id="ver">Bluetooth audio for PS4 &middot; CSR8510 or Realtek dongle</div>
   <div class="pill" id="pill">Starting</div>
 </div>
 <div class="grid g1">
@@ -371,7 +371,7 @@ var LO_MAX = 500;
 function paintSlider(v){ var sl = $("loSl"); sl.value = v; sl.style.setProperty("--p", (v * 100 / LO_MAX) + "%"); }
 function paintHs(v, on){ var sl = $("hsSl"); sl.value = v; sl.disabled = !on; sl.style.opacity = on ? "1" : ".35"; sl.style.setProperty("--p", v + "%"); }
 var KIND = {headset:"Headset",headphones:"Headphones",handsfree:"Hands-free",speaker:"Speaker",portable:"Portable audio",car:"Car audio",hifi:"Hi-Fi audio",av:"Audio/video device",tv:"TV / set-top box",audio:"Audio device",other:"Device"};
-var STATE = {starting:"Starting",scanning:"Scanning",connecting:"Connecting",authenticating:"Pairing",opening_audio:"Opening audio",streaming:"Streaming",disconnecting:"Disconnecting",reconnect_wait:"Looking for headphones",listening:"Ready",waiting_pairing:"Pairing mode needed",pairing_timeout:"Pairing timed out",no_devices:"No devices found",choose_device:"Choose a device",idle:"Idle",stopped:"Stopped",error_udp_bind:"Audio port busy"};
+var STATE = {starting:"Starting",scanning:"Scanning",connecting:"Connecting",authenticating:"Pairing",opening_audio:"Opening audio",streaming:"Streaming",disconnecting:"Disconnecting",reconnect_wait:"Looking for headphones",listening:"Ready",waiting_pairing:"Pairing mode needed",pairing_timeout:"Pairing timed out",no_devices:"No devices found",choose_device:"Choose a device",idle:"Idle",stopped:"Stopped",no_adapter:"No Bluetooth dongle",error_udp_bind:"Audio port busy"};
 function fmtTime(t){ var h = Math.floor(t / 3600), m = Math.floor(t % 3600 / 60), x = t % 60; return h ? h + "h " + (m < 10 ? "0" : "") + m + "m" : m ? m + "m " + (x < 10 ? "0" : "") + x + "s" : x + "s"; }
 function stName(s){ return STATE[s] || (s ? s.replace(/_/g," ") : "-"); }
 function signal(r){ if (!r) return ""; return r > -60 ? "Strong" : r > -75 ? "Good" : "Weak"; }
@@ -400,7 +400,8 @@ function renderPage(j){
   var hint = st === "reconnect_wait" ? "Trying the headphones for a few seconds" :
     ready ? "Open the case and the headphones connect by themselves, or press Try now" :
     st === "waiting_pairing" ? "Put the headphones in pairing mode" :
-    st === "pairing_timeout" ? "Pairing timed out. Put the headphones in pairing mode and press Try now" : "";
+    st === "pairing_timeout" ? "Pairing timed out. Put the headphones in pairing mode and press Try now" :
+    st === "no_adapter" ? "Plug in a CSR8510 (0A12:0001) or Realtek RTL8761BU dongle (0BDA:8771 / 0BDA:B00C, or a TP-Link / ASUS rebadge). The log lists any USB devices that were seen." : "";
   $("stHint").style.display = hint && !streaming ? "block" : "none";
   $("stHint").innerHTML = esc(hint);
   $("detail").style.display = streaming ? "block" : "none";
