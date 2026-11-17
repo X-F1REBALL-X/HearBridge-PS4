@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* HearBridge PS4 web UI: shared status, command queue and HTTP server
- * (port 8090, like HearBridge PS5). The HTTP server runs in its own thread;
+ * (port 6767). The HTTP server runs in its own thread;
  * the daemon updates status through ui_* setters and polls commands with
  * ui_take_cmd(). All shared data is guarded by one tiny spinlock. */
 #ifndef HEARBRIDGE_UI_H
@@ -20,7 +20,8 @@ enum ui_cmd_type {
     UI_CMD_CONNECT,     /* addr */
     UI_CMD_DISCONNECT,
     UI_CMD_FORGET,      /* addr */
-    UI_CMD_STOP
+    UI_CMD_STOP,
+    UI_CMD_REOPEN   /* switch USB adapter / re-init stick */
 };
 
 struct ui_cmd {
@@ -65,10 +66,23 @@ void ui_logbuf_add(const char *line);
 /* UI -> daemon */
 int  ui_take_cmd(struct ui_cmd *out);  /* 1 if a command was pending */
 int  ui_volume(void);                  /* boost, percent 0..500 (100 = unchanged) */
+int  ui_get_ui_vol(void);              /* unified meter 0..200 as the page shows */
 /* Audio loop: the page's equalizer (when on) and the Boost gain on
  * interleaved int16 stereo, gain_q8 from hb_gain_q8(). Same as hb_apply_gain
  * while the equalizer is off. */
 void ui_eq_apply(int16_t *pcm, int frames, int32_t gain_q8);
+int  ui_muted(void);
+int  ui_tone(void);
+int  ui_night(void);
+int  ui_key_vol(void);
+void ui_set_codec_caps(int avail);
+int  ui_get_codec_pref(void);           /* 0 Auto, 1 SBC, 2 HQ, 3 XQ */
+int  ui_get_lat_ms(void);               /* jitter-buffer target ms (slider) */
+int  ui_get_lat_auto(void);             /* 1 = adaptive latency on */
+void ui_set_lat_auto_ms(int ms);        /* report the target actually in effect */
+void ui_set_battery(int level, int pct);/* AVRCP headset battery (level -1 unknown) */
+void ui_set_levels(long pkts, long frames, float peak, float out_peak, int backlog, int per_packet);
+void ui_set_avrcp_flags(int connected, int abs_vol, int notif, int sink);
 /* AVRCP absolute volume of the headphones: avail 0 = not supported or not
  * connected; vol127 -1 = unknown. ui_take_hs_volume() returns a level the
  * page asked for (0..127) once, or -1. */
@@ -76,5 +90,13 @@ void ui_set_hs_volume(int avail, int vol127);
 int  ui_take_hs_volume(void);
 /* Console LAN address for the UI URL ("127.0.0.1" if unknown). */
 void ui_local_ip(char *out, int outlen);
+
+/* USB Bluetooth sticks seen on the last open (for the Connection page). */
+struct ui_adapter {
+    char id[12];     /* "0A12:0001" */
+    char label[40];  /* "CSR8510" */
+    int  in_use;
+};
+void ui_set_adapters(const struct ui_adapter *a, int n, const char *current_id);
 
 #endif

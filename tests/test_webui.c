@@ -64,6 +64,14 @@ static void feed(int32_t gain)
     ui_eq_apply(pcm, 480, gain);
 }
 
+/* The page is bigger than a default socket buffer and handle() writes it all
+ * before we read, so give the server side room for the whole answer. */
+static void roomy(int fd)
+{
+    int sz = 1 << 20;
+    setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &sz, sizeof sz);
+}
+
 /* One GET through handle(); the whole answer (headers and body) in out. */
 static long fetch(const char *path, unsigned char *out, size_t cap)
 {
@@ -73,6 +81,7 @@ static long fetch(const char *path, unsigned char *out, size_t cap)
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
     snprintf(rq, sizeof rq, "GET %s HTTP/1.1\r\nHost: x\r\n\r\n", path);
     if (write(sv[0], rq, strlen(rq)) < 0) return -1;
+    roomy(sv[1]);
     handle(sv[1], 0);
     close(sv[1]);
     while ((size_t)n < cap && (r = read(sv[0], out + n, cap - (size_t)n)) > 0) n += r;
@@ -80,7 +89,7 @@ static long fetch(const char *path, unsigned char *out, size_t cap)
     return n;
 }
 
-static unsigned char resp[80000];
+static unsigned char resp[400000];
 static const unsigned char *body_of(long n)
 {
     long i;
@@ -132,12 +141,12 @@ static void test_pwa(void)
 
     /* the page links all of it, and the old routes still work */
     CHECK(strstr(webui_html, "<link rel=\"manifest\" href=\"/manifest.webmanifest\">") != NULL);
-    CHECK(strstr(webui_html, "<link rel=\"apple-touch-icon\" href=\"/apple-touch-icon.png\">") != NULL);
-    CHECK(strstr(webui_html, "<meta name=\"theme-color\" content=\"#0e0f14\">") != NULL);
+    CHECK(strstr(webui_html, "<link rel=\"apple-touch-icon\" sizes=\"180x180\" href=\"/app-icon-180.png\">") != NULL);
+    CHECK(strstr(webui_html, "<meta name=\"theme-color\" content=\"#121117\">") != NULL);
     CHECK(strstr(webui_html, "apple-mobile-web-app-capable") && strstr(webui_html, "mobile-web-app-capable"));
     CHECK(strstr(webui_html, "X-HB-Token") != NULL);
     CHECK(strstr(webui_html, "beforeinstallprompt") == NULL && strstr(webui_html, "Install app") == NULL && strstr(webui_html, "id=\"inst\"") == NULL); /* no install button */
-    CHECK(strstr(webui_html, "j.game.name && j.game.run === j.tap_title") != NULL);   /* the Streaming line shows the real name when known */
+    CHECK(strstr(webui_html, "g=S.game||{}") != NULL);                                 /* the page reads the game block */
     n = fetch("/", resp, sizeof resp - 1);
     CHECK(n > 1000 && strncmp((char *)resp, "HTTP/1.1 200 OK", 15) == 0);
     n = fetch("/api/status", resp, sizeof resp - 1);
@@ -154,6 +163,7 @@ static long raw(const char *rq, int loopback)
     long n = 0, r;
     if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) != 0) return -1;
     if (write(sv[0], rq, strlen(rq)) < 0) return -1;
+    roomy(sv[1]);
     handle(sv[1], loopback);
     close(sv[1]);
     while ((size_t)n < sizeof resp - 1 && (r = read(sv[0], resp + n, sizeof resp - 1 - (size_t)n)) > 0) n += r;
@@ -180,41 +190,41 @@ static void test_security(void)
     CHECK(strlen(g_ui_tok) == 32 && strspn(g_ui_tok, "0123456789abcdef") == 32);
 
     /* the status carries the token */
-    n = raw("GET /api/status HTTP/1.1\r\nHost: 192.0.2.20:8090\r\n\r\n", 0);
+    n = raw("GET /api/status HTTP/1.1\r\nHost: 192.0.2.20:6767\r\n\r\n", 0);
     CHECK(n > 0 && code_is(200));
     tk = strstr((char *)resp, "\"token\":\"");
     CHECK(tk && strncmp(tk + 9, g_ui_tok, 32) == 0);
 
     /* state changes need the token (header or k=), from the page's own origin */
     while (ui_take_cmd(&c)) ;
-    raw("GET /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:8090\r\n\r\n", 0);
+    raw("GET /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:6767\r\n\r\n", 0);
     CHECK(code_is(403) && !ui_take_cmd(&c));
-    raw("POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:8090\r\nX-HB-Token: 00000000000000000000000000000000\r\n\r\n", 0);
+    raw("POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:6767\r\nX-HB-Token: 00000000000000000000000000000000\r\n\r\n", 0);
     CHECK(code_is(403) && !ui_take_cmd(&c));
-    snprintf(rq, sizeof rq, "POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:8090\r\nx-hb-token: %s\r\n\r\n", g_ui_tok);
+    snprintf(rq, sizeof rq, "POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:6767\r\nx-hb-token: %s\r\n\r\n", g_ui_tok);
     raw(rq, 0);
     CHECK(code_is(200) && ui_take_cmd(&c) && c.type == UI_CMD_SCAN);
-    snprintf(rq, sizeof rq, "GET /api/cmd?c=scan&k=%s&back=1 HTTP/1.1\r\nHost: 192.0.2.20:8090\r\n\r\n", g_ui_tok);
+    snprintf(rq, sizeof rq, "GET /api/cmd?c=scan&k=%s&back=1 HTTP/1.1\r\nHost: 192.0.2.20:6767\r\n\r\n", g_ui_tok);
     raw(rq, 0);
     CHECK(code_is(303) && ui_take_cmd(&c));
-    snprintf(rq, sizeof rq, "POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:8090\r\nOrigin: http://192.0.2.20:8090\r\nX-HB-Token: %s\r\n\r\n", g_ui_tok);
+    snprintf(rq, sizeof rq, "POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:6767\r\nOrigin: http://192.0.2.20:6767\r\nX-HB-Token: %s\r\n\r\n", g_ui_tok);
     raw(rq, 0);
     CHECK(code_is(200) && ui_take_cmd(&c));
-    snprintf(rq, sizeof rq, "POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:8090\r\nOrigin: http://evil.example\r\nX-HB-Token: %s\r\n\r\n", g_ui_tok);
+    snprintf(rq, sizeof rq, "POST /api/cmd?c=scan HTTP/1.1\r\nHost: 192.0.2.20:6767\r\nOrigin: http://evil.example\r\nX-HB-Token: %s\r\n\r\n", g_ui_tok);
     raw(rq, 0);
     CHECK(code_is(403) && !ui_take_cmd(&c));
 
     /* Host: addresses and private names pass, a public name (DNS rebinding) does not */
-    CHECK(host_ok("") && host_ok("192.0.2.7") && host_ok("192.0.2.7:8090") && host_ok("127.0.0.1:8091"));
-    CHECK(host_ok("ps4") && host_ok("ps4.local:8090") && host_ok("Console.LAN") && host_ok("localhost"));
-    CHECK(!host_ok("evil.example.com") && !host_ok("1.2.3.4.evil.com") && !host_ok("evil.example.com:8090"));
+    CHECK(host_ok("") && host_ok("192.0.2.7") && host_ok("192.0.2.7:6767") && host_ok("127.0.0.1:6768"));
+    CHECK(host_ok("ps4") && host_ok("ps4.local:6767") && host_ok("Console.LAN") && host_ok("localhost"));
+    CHECK(!host_ok("evil.example.com") && !host_ok("1.2.3.4.evil.com") && !host_ok("evil.example.com:6767"));
     raw("GET /api/status HTTP/1.1\r\nHost: rebind.example.com\r\n\r\n", 0);
     CHECK(code_is(403));
     raw("GET / HTTP/1.1\r\nHost: rebind.example.com\r\n\r\n", 0);
     CHECK(code_is(403));
 
     /* /api/quit: loopback (the new daemon taking over) or the token */
-    raw("GET /api/quit HTTP/1.0\r\nHost: 192.0.2.20:8090\r\n\r\n", 0);
+    raw("GET /api/quit HTTP/1.0\r\nHost: 192.0.2.20:6767\r\n\r\n", 0);
     CHECK(code_is(403) && !ui_take_cmd(&c));
     raw("GET /api/quit HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n", 1);
     CHECK(code_is(200) && ui_take_cmd(&c) && c.type == UI_CMD_STOP);
@@ -258,7 +268,7 @@ int main(void)
     CHECK(fabs(rms() / flat - 1.0) < 0.001);
     status();
     CHECK(balanced(json) && strstr(json, "\"eq\":{\"on\":0,\"db\":[12,3,0,0,-12]}") != NULL);
-    CHECK(strstr(json, "\"game\":{\"mode\":1,\"run\":\"\",\"name\":\"\",\"has\":0,\"active\":0,\"dirty\":0,\"saved\":[]}") != NULL);
+    CHECK(strstr(json, "\"game\":{\"avail\":1,\"mode\":1,\"id\":\"\",\"run\":\"\",\"name\":\"\",\"has\":0,\"profile\":0,\"active\":0,\"dirty\":0,\"saved\":[]}") != NULL);
 
     /* slider requests do not write at once; the daemon's poll writes them when it has been quiet */
     unlink("/tmp/hbt/settings.txt");
@@ -279,7 +289,7 @@ int main(void)
             if (!strcmp(line, "eq=0\n")) got |= 1;
             if (!strcmp(line, "eqdb=12,3,0,0,-12\n")) got |= 2;
             if (!strcmp(line, "gamemode=1\n")) got |= 4;
-            if (!strcmp(line, "loudness=180\n")) got |= 8;
+            if (!strcmp(line, "loudness=100\n")) got |= 8;
         }
         if (f) fclose(f);
         CHECK(got == 15);
@@ -292,16 +302,16 @@ int main(void)
     CHECK(!strcmp(S.run, "CUSA55885") && !S.applied[0]);
     status();
     CHECK(strstr(json, "\"run\":\"CUSA55885\"") && strstr(json, "\"has\":0"));
-    run("c=gsave");                                                /* saves the live sound: boost 180, EQ off */
-    CHECK(S.gps.n == 1 && S.gps.g[0].boost == 180 && !S.gps.g[0].eq_on && !strcmp(S.applied, "CUSA55885"));
+    run("c=gsave");                                                /* saves the live sound: boost 100, EQ off */
+    CHECK(S.gps.n == 1 && S.gps.g[0].boost == 100 && !S.gps.g[0].eq_on && !strcmp(S.applied, "CUSA55885"));
     /* set the sound for this game and save again */
     run("c=volume&v=250");
     run("c=eq&on=1&b0=6&b1=3&b2=0&b3=2&b4=4");
     status();
-    CHECK(strstr(json, "\"has\":1,\"active\":1,\"dirty\":1"));     /* live differs from what was saved */
+    CHECK(strstr(json, "\"has\":1,\"profile\":1,\"active\":1,\"dirty\":1"));     /* live differs from what was saved */
     run("c=gsave");
     status();
-    CHECK(strstr(json, "\"has\":1,\"active\":1,\"dirty\":0") && S.gps.n == 1 && S.gps.g[0].boost == 250 && S.gps.g[0].eq_on);
+    CHECK(strstr(json, "\"has\":1,\"profile\":1,\"active\":1,\"dirty\":0") && S.gps.n == 1 && S.gps.g[0].boost == 250 && S.gps.g[0].eq_on);
     CHECK(balanced(json) && strstr(json, "\"saved\":[{\"id\":\"CUSA55885\"") && strstr(json, "\"boost\":250"));
     /* the usual sound on disk is the one from before the game, not the profile */
     {
@@ -309,7 +319,7 @@ int main(void)
         int got = 0;
         FILE *f = fopen("/tmp/hbt/settings.txt", "r");
         while (f && fgets(line, sizeof line, f)) {
-            if (!strcmp(line, "loudness=180\n")) got |= 1;
+            if (!strcmp(line, "loudness=100\n")) got |= 1;
             if (!strcmp(line, "eq=0\n")) got |= 2;
         }
         if (f) fclose(f);
@@ -318,7 +328,7 @@ int main(void)
     /* tweak while the profile is on, then the game ends: everything back to the usual sound */
     run("c=volume&v=400");
     ui_set_pcm(99, 40, "CUSA55885", 0);                            /* silent for 40 s: closed */
-    CHECK(!S.run[0] && !S.applied[0] && S.volume == 180 && !S.eq_on && S.eq_db[0] == 0);
+    CHECK(!S.run[0] && !S.applied[0] && S.volume == 100 && !S.eq_on && S.eq_db[0] == 0);
     feed(256);
     CHECK(fabs(rms() / flat - 1.0) < 0.001);                        /* the audio path follows */
 
@@ -328,7 +338,7 @@ int main(void)
     feed(256);
     CHECK(rms() / flat > 1.7);
     ui_set_streaming(0);
-    CHECK(!S.run[0] && S.volume == 180 && !S.eq_on);
+    CHECK(!S.run[0] && S.volume == 100 && !S.eq_on);
     ui_set_streaming(1);
 
     /* a user change while no game runs is the usual sound and sticks */
@@ -338,30 +348,30 @@ int main(void)
     run("c=volume&v=300");
     ui_set_pcm(2, 40, "CUSA00001", 0);                              /* it closes: no profile was on, nothing is undone */
     CHECK(S.volume == 300 && !S.run[0]);
-    run("c=volume&v=180");
+    run("c=volume&v=100");
 
     /* switching from a game with a profile to one without */
     ui_set_pcm(3, 0, "CUSA55885", 0);
     CHECK(S.volume == 250);
     ui_set_pcm(4, 0, "CUSA00001", 0);
-    CHECK(!S.applied[0] && S.volume == 180 && !S.eq_on && !strcmp(S.run, "CUSA00001"));
+    CHECK(!S.applied[0] && S.volume == 100 && !S.eq_on && !strcmp(S.run, "CUSA00001"));
     ui_set_pcm(5, 0, "CUSA55885", 0);
     CHECK(S.volume == 250 && !strcmp(S.applied, "CUSA55885"));
 
     /* Game mode off: the profile goes away at once and does not come back at the next start */
     run("c=gamemode&on=0");
-    CHECK(S.gmode == 0 && !S.applied[0] && S.volume == 180 && !S.eq_on);
+    CHECK(S.gmode == 0 && !S.applied[0] && S.volume == 100 && !S.eq_on);
     status();
-    CHECK(strstr(json, "\"mode\":0") && strstr(json, "\"has\":1,\"active\":0"));
+    CHECK(strstr(json, "\"mode\":0") && strstr(json, "\"has\":1,\"profile\":1,\"active\":0"));
     ui_set_pcm(6, 40, "CUSA55885", 0);
     ui_set_pcm(7, 0, "CUSA55885", 0);
-    CHECK(S.volume == 180 && !S.applied[0]);
+    CHECK(S.volume == 100 && !S.applied[0]);
     run("c=gamemode&on=1");                                         /* back on while the game runs: applied */
     CHECK(S.gmode == 1 && S.volume == 250 && !strcmp(S.applied, "CUSA55885"));
 
     /* remove: the running game's profile goes, the usual sound returns */
     run("c=gdel");
-    CHECK(S.gps.n == 0 && !S.applied[0] && S.volume == 180);
+    CHECK(S.gps.n == 0 && !S.applied[0] && S.volume == 100);
     run("c=gdel&id=CUSA55885");                                     /* nothing left to remove */
     status();
     CHECK(strstr(json, "\"has\":0") && strstr(json, "\"saved\":[]"));

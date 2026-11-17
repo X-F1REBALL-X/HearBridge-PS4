@@ -22,6 +22,9 @@ void pcm_udp_close(void);
  * arrived, 0 otherwise. */
 int pcm_udp_poll(void);
 
+/* Same-process feed from game_tap (bypasses UDP). nbytes = frames*4. */
+void pcm_udp_feed(const void *data, int nbytes);
+
 /* Send "stop" to 127.0.0.1:9500 (ask a running daemon to exit). */
 void pcm_udp_send_stop(void);
 
@@ -32,6 +35,10 @@ int pcm_udp_read_s16(int16_t *out, int max_frames);
 /* Sample rate of the frames pcm_udp_read_s16 returns (default 48000). The
  * 48 kHz input is resampled to it. */
 void pcm_udp_set_out_rate(int hz);
+
+/* Jitter-buffer target from the UI latency control (20..190 ms). */
+void pcm_udp_set_target_ms(int ms);
+int  pcm_udp_target_ms(void);
 
 /* Frames currently buffered. */
 int pcm_udp_buffered(void);

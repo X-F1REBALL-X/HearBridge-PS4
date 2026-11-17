@@ -5,14 +5,17 @@
 #include "linkkeys.h"
 #include "cod.h"
 #include "boost.h"
+#include "adapter_pref.h"
 #include "cmdq.h"
 #include "eq.h"
 #include "gprof.h"
 #include "atomicfile.h"
+#include "backup.h"
 
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <math.h>
 #include <unistd.h>
 #include <fcntl.h>
 #include <errno.h>
@@ -83,6 +86,7 @@ static struct {
     struct cmdq cmdq;               /* commands from the page, oldest first */
     unsigned cmd_n;                 /* entries in cmdq (read without the lock as a hint) */
     int volume;                /* boost percent 0..HB_LOUD_MAX (boost.h) */
+    int ui_vol;                 /* unified meter 0..200 (what the page shows) */
     int hs_avail, hs_vol, hs_req;   /* headphone volume (AVRCP): available, level 0..127, page request+1 */
     uint64_t stream_t0;        /* process time (us) when streaming began */
     char error[192];           /* last FAIL line of the daemon, cleared at streaming */
@@ -93,12 +97,24 @@ static struct {
     /* equalizer (the page sets it, the audio loop reads it through eq_gen) */
     int eq_on, eq_db[HB_EQ_NB];
     unsigned eq_gen;
+    int muted, tone, night_on, key_vol, codec_avail, codec_pref;
+    int lat_ms, lat_auto, lat_auto_ms;
+    long pkts, frames;
+    float peak, out_peak;
+    int backlog, sample_rate, bitpool_min, per_packet;
+    int avrcp_conn, avrcp_abs, avrcp_notif, avrcp_sink;
+    int link_score, link_rssi, link_drops;
+    int batt_level, batt_pct;  /* AVRCP headset battery: level 0..4 (-1 unknown), pct */
+    double tone_phase;
     /* game mode: profiles, the running game, the profile now on, the usual sound */
     hb_gps gps;
     int gmode;
     char run[10], applied[10], run_name[HB_GP_NAME];
     int base_boost, base_eq_on, base_eq_db[HB_EQ_NB];
     int save_due;              /* settings or games changed inside a locked section: write them */
+    struct ui_adapter adapt[HB_AD_MAX];
+    int nadapt;
+    char adapt_cur[12];
 } S;
 
 static void settings_save(void);
@@ -117,8 +133,20 @@ void ui_set_state(const char *st)
 void ui_set_device(const unsigned char addr[6], const char *name)
 {
     lock();
-    S.have_dev = addr != NULL;
-    if (addr) memcpy(S.dev_addr, addr, 6);
+    if (!addr) {
+        /* Brief disconnect (codec change / reconnect): keep last battery so
+         * the page does not flash "Not shown". Caps still clear. */
+        S.have_dev = 0;
+        S.codec_avail = 0;
+    } else {
+        /* A different headset: drop the previous battery reading. */
+        if (!S.have_dev || memcmp(S.dev_addr, addr, 6) != 0) {
+            S.batt_level = -1;
+            S.batt_pct = -1;
+        }
+        S.have_dev = 1;
+        memcpy(S.dev_addr, addr, 6);
+    }
     snprintf(S.dev_name, sizeof S.dev_name, "%s", name ? name : "");
     unlock();
 }
@@ -129,11 +157,62 @@ void ui_set_stream(const char *codec, int rate, int bitpool, int bitpool_max,
     lock();
     snprintf(S.codec, sizeof S.codec, "%s", codec ? codec : "");
     S.rate = rate;
+    S.sample_rate = rate;
     S.bitpool = bitpool;
     S.bitpool_max = bitpool_max;
+    if (S.bitpool_min <= 0 || bitpool < S.bitpool_min) S.bitpool_min = bitpool;
     S.pcm_ms = pcm_ms;
     S.media_drops = media_drops;
     S.resyncs = resyncs;
+    S.link_drops = media_drops;
+    /* Rough link score from drops this stream. */
+    {
+        int sc = 100;
+        if (media_drops > 0) sc = 80;
+        if (media_drops > 20) sc = 55;
+        if (media_drops > 100) sc = 30;
+        if (media_drops > 500) sc = 10;
+        S.link_score = sc;
+        if (S.link_rssi == 0) S.link_rssi = -1;
+    }
+    unlock();
+}
+
+void ui_set_levels(long pkts, long frames, float peak, float out_peak, int backlog, int per_packet)
+{
+    lock();
+    S.pkts = pkts;
+    S.frames = frames;
+    S.peak = peak;
+    S.out_peak = out_peak;
+    S.backlog = backlog;
+    S.per_packet = per_packet;
+    unlock();
+}
+
+void ui_set_avrcp_flags(int connected, int abs_vol, int notif, int sink)
+{
+    lock();
+    S.avrcp_conn = connected;
+    S.avrcp_abs = abs_vol;
+    S.avrcp_notif = notif;
+    S.avrcp_sink = sink;
+    unlock();
+}
+
+
+void ui_set_adapters(const struct ui_adapter *a, int n, const char *current_id)
+{
+    int i;
+    if (n < 0) n = 0;
+    if (n > HB_AD_MAX) n = HB_AD_MAX;
+    lock();
+    S.nadapt = n;
+    for (i = 0; i < n; i++) S.adapt[i] = a[i];
+    if (current_id && current_id[0])
+        snprintf(S.adapt_cur, sizeof S.adapt_cur, "%s", current_id);
+    else
+        S.adapt_cur[0] = 0;
     unlock();
 }
 
@@ -142,10 +221,17 @@ void ui_set_streaming(int on)
     int save;
     lock();
     S.streaming = on;
-    if (!on) game_tick_locked("", 0, 0);
+    if (!on) {
+        game_tick_locked("", 0, 0);
+        S.pkts = S.frames = 0;
+        S.peak = S.out_peak = 0;
+        S.backlog = S.per_packet = 0;
+        S.link_score = -1;
+    }
     save = S.save_due;
     if (on) {
         S.pcm_rx = 0; S.pcm_idle_s = 0; S.tap_title[0] = 0; S.pcm_lost = 0;
+        S.pkts = S.frames = 0; S.peak = S.out_peak = 0; S.bitpool_min = 0;
         S.stream_t0 = sceKernelGetProcessTime();
         S.error[0] = 0;
     }
@@ -257,6 +343,11 @@ int ui_volume(void)
     return __atomic_load_n(&S.volume, __ATOMIC_RELAXED);
 }
 
+int ui_get_ui_vol(void)
+{
+    return __atomic_load_n(&S.ui_vol, __ATOMIC_RELAXED);
+}
+
 static void put_cmd(int type, const unsigned char *addr)
 {
     lock();
@@ -285,9 +376,18 @@ static void settings_load(void)
     FILE *f = fopen(SETTINGS_PATH, "r");
     char line[64];
     S.volume = HB_LOUD_DEFAULT;
+    S.ui_vol = HB_LOUD_DEFAULT;  /* meter starts at 100 (no boost) */
     S.hs_vol = -1;
+    S.batt_level = -1;
+    S.batt_pct = -1;
     S.gmode = 1;
     S.eq_gen = 1;
+    S.key_vol = 1;
+    S.codec_avail = 2;
+    S.codec_pref = 0;
+    S.lat_ms = 200;
+    S.lat_auto = 1;
+    S.lat_auto_ms = 0;
     games_load();
     if (!f) return;
     while (fgets(line, sizeof line, f)) {
@@ -306,6 +406,16 @@ static void settings_load(void)
             int v = atoi(line + 6);
             if (v == 0) S.volume = 100;
             else if (v == 2) S.volume = 280;
+        } else if (strncmp(line, "codec=", 6) == 0) {
+            int v = atoi(line + 6);
+            if (v < 0) v = 0;
+            if (v > 3) v = 3;
+            S.codec_pref = v;
+        } else if (strncmp(line, "ui_vol=", 7) == 0) {
+            int v = atoi(line + 7);
+            if (v < 0) v = 0;
+            if (v > 200) v = 200;
+            S.ui_vol = v;
         }
     }
     fclose(f);
@@ -315,8 +425,8 @@ static void settings_load(void)
  * from before it, not the profile (the profile lives in games.txt). */
 static void settings_save(void)
 {
-    int boost, eq_on, db[HB_EQ_NB], gmode, n;
-    char dbs[40], txt[160];
+    int boost, eq_on, db[HB_EQ_NB], gmode, uivol, n;
+    char dbs[40], txt[192];
     lock();
     if (S.applied[0]) {
         boost = S.base_boost; eq_on = S.base_eq_on; memcpy(db, S.base_eq_db, sizeof db);
@@ -324,11 +434,12 @@ static void settings_save(void)
         boost = S.volume; eq_on = S.eq_on; memcpy(db, S.eq_db, sizeof db);
     }
     gmode = S.gmode;
+    uivol = S.ui_vol;
     S.save_due = 0;
     unlock();
     hb_eq_format(db, dbs, sizeof dbs);
     mkdir("/data/hearbridge", 0777);
-    n = snprintf(txt, sizeof txt, "loudness=%d\neq=%d\neqdb=%s\ngamemode=%d\n", boost, eq_on, dbs, gmode);
+    n = snprintf(txt, sizeof txt, "loudness=%d\neq=%d\neqdb=%s\ngamemode=%d\ncodec=%d\nui_vol=%d\n", boost, eq_on, dbs, gmode, S.codec_pref, uivol);
     if (hb_file_write_atomic(SETTINGS_PATH, txt, (size_t)n) != 0) printf("[hb-ui] could not save %s\n", SETTINGS_PATH);
 }
 
@@ -416,6 +527,7 @@ void ui_eq_apply(int16_t *pcm, int frames, int32_t gain_q8)
     static hb_eq eq;
     static unsigned seen;
     static int inited;
+    int i, muted, night, tone;
     unsigned gen = __atomic_load_n(&S.eq_gen, __ATOMIC_ACQUIRE);
     if (!inited) { hb_eq_init(&eq); inited = 1; }
     if (gen != seen) {
@@ -427,8 +539,76 @@ void ui_eq_apply(int16_t *pcm, int frames, int32_t gain_q8)
         hb_eq_set(&eq, on, db, 48000);
         seen = gen;
     }
+    muted = __atomic_load_n(&S.muted, __ATOMIC_RELAXED);
+    night = __atomic_load_n(&S.night_on, __ATOMIC_RELAXED);
+    tone  = __atomic_load_n(&S.tone, __ATOMIC_RELAXED);
+    if (muted) {
+        memset(pcm, 0, (size_t)frames * 2 * sizeof(int16_t));
+        return;
+    }
+    if (tone) {
+        /* 440 Hz stereo sine, ~-12 dBFS, replaces stream audio while on. */
+        double ph = S.tone_phase;
+        const double step = 2.0 * 3.141592653589793 * 440.0 / 48000.0;
+        for (i = 0; i < frames; i++) {
+            int16_t s = (int16_t)(sin(ph) * 8000.0);
+            pcm[i * 2] = s;
+            pcm[i * 2 + 1] = s;
+            ph += step;
+            if (ph > 2.0 * 3.141592653589793) ph -= 2.0 * 3.141592653589793;
+        }
+        S.tone_phase = ph;
+        return;
+    }
+    if (night) {
+        /* Soft night mode: drop ~6 dB before EQ. */
+        int32_t g = (gain_q8 * 128) >> 8;
+        if (g < 1) g = 1;
+        hb_eq_apply(&eq, pcm, frames, g);
+        return;
+    }
     hb_eq_apply(&eq, pcm, frames, gain_q8);
 }
+
+int ui_muted(void) { return __atomic_load_n(&S.muted, __ATOMIC_RELAXED); }
+int ui_tone(void) { return __atomic_load_n(&S.tone, __ATOMIC_RELAXED); }
+int ui_night(void) { return __atomic_load_n(&S.night_on, __ATOMIC_RELAXED); }
+int ui_key_vol(void) { return __atomic_load_n(&S.key_vol, __ATOMIC_RELAXED); }
+void ui_set_codec_caps(int avail)
+{
+    if (avail < 2) avail = 2; /* always at least SBC */
+    __atomic_store_n(&S.codec_avail, avail, __ATOMIC_RELAXED);
+}
+
+int ui_get_codec_pref(void)
+{
+    return __atomic_load_n(&S.codec_pref, __ATOMIC_RELAXED);
+}
+
+int ui_get_lat_ms(void)
+{
+    int v = __atomic_load_n(&S.lat_ms, __ATOMIC_RELAXED);
+    return v > 0 ? v : 200;
+}
+int ui_get_lat_auto(void)
+{
+    return __atomic_load_n(&S.lat_auto, __ATOMIC_RELAXED) != 0;
+}
+void ui_set_lat_auto_ms(int ms)
+{
+    __atomic_store_n(&S.lat_auto_ms, ms, __ATOMIC_RELAXED);
+}
+
+/* Headset battery: AVRCP level 0..4 (-1 unknown); HFP uses level -2 + pct.
+ * pct already mapped by the caller (-1 when unknown). */
+void ui_set_battery(int level, int pct)
+{
+    lock();
+    S.batt_level = level;
+    S.batt_pct = pct;
+    unlock();
+}
+
 
 /* Name of a game from its param.sfo ("" when unknown). */
 static void game_name_read(const char *id, char *out, size_t outn)
@@ -626,9 +806,37 @@ static void build_status(struct sb *b)
     }
     sb_add(b, ",\"codec\":");
     sb_str(b, S.codec);
-    sb_add(b, ",\"rate\":%d,\"bitpool\":%d,\"bitpool_max\":%d,\"buffer_ms\":%d,"
+    sb_add(b, ",\"rate\":%d,\"bitpool\":%d,\"bitpool_min\":%d,\"bitpool_max\":%d,\"buffer_ms\":%d,"
               "\"drops\":%d,\"resyncs\":%d,\"volume\":%d",
-           S.rate, S.bitpool, S.bitpool_max, S.pcm_ms, S.media_drops, S.resyncs, S.volume);
+           S.rate, S.bitpool, S.bitpool_min ? S.bitpool_min : S.bitpool, S.bitpool_max, S.pcm_ms,
+           S.media_drops, S.resyncs, S.volume);
+    sb_add(b, ",\"pkts\":%ld,\"frames\":%ld,\"peak\":%.3f,\"out_peak\":%.3f,"
+              "\"backlog\":%d,\"sample_rate\":%d,\"per_packet\":%d",
+           S.pkts, S.frames, (double)S.peak, (double)S.out_peak, S.backlog,
+           S.sample_rate ? S.sample_rate : S.rate, S.per_packet);
+    sb_add(b, ",\"avrcp\":{\"connected\":%d,\"absolute_volume\":%d,\"notifications\":%d,\"sink_volume\":%d}",
+           S.avrcp_conn, S.avrcp_abs, S.avrcp_notif, S.avrcp_sink);
+    sb_add(b, ",\"link\":{\"score\":%d,\"rssi\":%d,\"lq\":-1,\"drops_min\":%d}",
+           S.streaming ? (S.link_score > 0 ? S.link_score : 70) : -1,
+           S.link_rssi ? S.link_rssi : -1, S.link_drops);
+    if (S.batt_level == -2 && S.batt_pct >= 0) {
+        /* HFP AG percent (Sony / Apple AT); no AVRCP level. */
+        int bpct = S.batt_pct;
+        const char *bs = bpct <= 10 ? "critical" : bpct <= 20 ? "low" : "ok";
+        sb_add(b, ",\"battery\":{\"present\":1,\"none\":0,\"pct\":%d,\"status\":\"%s\"}", bpct, bs);
+    } else if (S.batt_level >= 0) {
+        const char *bs = S.batt_level == 3 ? "charging" : S.batt_level == 4 ? "full" :
+                         S.batt_level == 2 ? "critical" : S.batt_level == 1 ? "low" : "ok";
+        int bpct = S.batt_pct;
+        if (bpct < 0)
+            bpct = S.batt_level == 3 ? 100 :
+                   S.batt_level == 4 ? 100 :
+                   S.batt_level == 2 ? 10 :
+                   S.batt_level == 1 ? 20 : 50;
+        sb_add(b, ",\"battery\":{\"present\":1,\"none\":0,\"pct\":%d,\"status\":\"%s\"}", bpct, bs);
+    } else {
+        sb_add(b, ",\"battery\":{\"present\":0,\"none\":1,\"pct\":-1}");
+    }
     sb_add(b, ",\"pcm_rx\":%lu,\"pcm_idle_s\":%ld,\"pcm_lost\":%d,\"tap_title\":",
            S.pcm_rx, S.pcm_idle_s, S.pcm_lost);
     sb_str(b, S.tap_title);
@@ -676,7 +884,8 @@ static void build_status(struct sb *b)
             sb_str(b, a);
             sb_add(b, ",\"name\":");
             sb_str(b, sd[best].name);
-            sb_add(b, ",\"kind\":\"%s\",\"last\":%d}", cod_kind(sd[best].cod), out == 0);
+            sb_add(b, ",\"kind\":\"%s\",\"last\":%d,\"current\":%d}", cod_kind(sd[best].cod), out == 0,
+                   S.have_dev && !memcmp(sd[best].addr, S.dev_addr, 6));
             out++;
         }
     }
@@ -691,11 +900,13 @@ static void build_status(struct sb *b)
            S.eq_db[2], S.eq_db[3], S.eq_db[4]);
     {
         int own = S.run[0] ? hb_gps_find(&S.gps, S.run) : -1;
-        sb_add(b, ",\"game\":{\"mode\":%d,\"run\":", S.gmode);
+        sb_add(b, ",\"game\":{\"avail\":1,\"mode\":%d,\"id\":", S.gmode);
+        sb_str(b, S.run);
+        sb_add(b, ",\"run\":");
         sb_str(b, S.run);
         sb_add(b, ",\"name\":");
         sb_str(b, S.run_name);
-        sb_add(b, ",\"has\":%d,\"active\":%d,\"dirty\":%d,\"saved\":[", own >= 0,
+        sb_add(b, ",\"has\":%d,\"profile\":%d,\"active\":%d,\"dirty\":%d,\"saved\":[", own >= 0, own >= 0,
                S.applied[0] != 0 && own >= 0 && !strcmp(S.applied, S.run),
                own >= 0 ? hb_gp_differs(&S.gps.g[own], S.eq_on, S.eq_db, S.volume) : 0);
         for (i = 0; i < S.gps.n; i++) {
@@ -710,6 +921,64 @@ static void build_status(struct sb *b)
         sb_add(b, "]}");
     }
     unlock();
+
+    /* Fields the 1.4.2-style page expects (alongside the PS4 ones above). */
+    {
+        char pref[24];
+        int i;
+        hb_adapter_pref_word(pref, (int)sizeof pref);
+        sb_add(b, ",\"connected\":%d", S.streaming || S.have_dev);
+        /* Keep PS4 device object above; add display name separately. */
+        sb_add(b, ",\"device_name\":");
+        sb_str(b, S.have_dev && S.dev_name[0] ? S.dev_name : "");
+        sb_add(b, ",\"gain_pct\":%d,\"ui_vol\":%d,\"sample_rate\":%d,\"headset_volume\":%d",
+               S.volume, S.ui_vol, S.rate, S.hs_vol < 0 ? -1 : S.hs_vol);
+        sb_add(b, ",\"muted\":%d,\"night\":{\"on\":%d},\"paused\":0,\"tone\":%d,\"key_vol\":%d", S.muted, S.night_on, S.tone, S.key_vol);
+        {
+            int tgt = (S.lat_auto && S.lat_auto_ms > 0) ? S.lat_auto_ms : (S.lat_ms > 0 ? S.lat_ms : 200);
+            int est = S.streaming && S.pcm_ms > 0 ? S.pcm_ms + 40 : 0;
+            int qms = S.pcm_ms > 0 ? S.pcm_ms : tgt;
+            sb_add(b, ",\"latency\":{\"target_ms\":%d,\"estimate_ms\":%d,\"capture_ms\":8,\"packet_ms\":14,\"queue_ms\":%d,\"radio_ms\":40,\"sink_ms\":30,\"sink_reported\":0}",
+                   tgt, est, qms);
+            sb_add(b, ",\"lat_extra\":{\"backoff_ms\":0,\"normal_ms\":200,\"auto\":%d,\"auto_ms\":%d}",
+                   S.lat_auto != 0, S.lat_auto_ms);
+        }
+        sb_add(b, ",\"codec_pref\":%d,\"codec_avail\":%d", S.codec_pref, S.codec_avail ? S.codec_avail : 2);
+        sb_add(b, ",\"adapter\":{\"pref\":");
+        sb_str(b, pref);
+        sb_add(b, ",\"external\":1,\"node\":");
+        sb_str(b, S.adapt_cur);
+        sb_add(b, ",\"adapters\":[");
+        for (i = 0; i < S.nadapt; i++) {
+            sb_add(b, "%s{\"node\":", i ? "," : "");
+            sb_str(b, S.adapt[i].id);
+            sb_add(b, ",\"label\":");
+            sb_str(b, S.adapt[i].label);
+            sb_add(b, ",\"internal\":0,\"in_use\":%d}",
+                   S.adapt[i].in_use ||
+                   (S.adapt_cur[0] && !strcmp(S.adapt_cur, S.adapt[i].id)));
+        }
+        sb_add(b, "]}");
+        {
+            char chipbuf[48];
+            const char *chipn = "";
+            chipbuf[0] = 0;
+            for (i = 0; i < S.nadapt; i++) {
+                if (S.adapt_cur[0] && !strcmp(S.adapt_cur, S.adapt[i].id)) {
+                    snprintf(chipbuf, sizeof chipbuf, "%s", S.adapt[i].label);
+                    break;
+                }
+            }
+            if (!chipbuf[0] && S.nadapt > 0)
+                snprintf(chipbuf, sizeof chipbuf, "%s", S.adapt[0].label);
+            chipn = chipbuf[0] ? chipbuf : (S.adapt_cur[0] ? S.adapt_cur : "");
+            sb_add(b, ",\"chip\":{\"name\":");
+            sb_str(b, chipn);
+            sb_add(b, ",\"family\":");
+            sb_str(b, chipn);
+            sb_add(b, ",\"vid\":0,\"pid\":0}");
+        }
+    }
     sb_add(b, "}");
 }
 
@@ -735,15 +1004,21 @@ static void send_all(int fd, const char *p, size_t n)
     }
 }
 
+static void respond_status(int fd, int code, const char *reason, const char *type,
+                           const char *body, size_t len)
+{
+    char hdr[288];
+    int h = snprintf(hdr, sizeof hdr,
+                     "HTTP/1.1 %d %s\r\nContent-Type: %s\r\nContent-Length: %u\r\n"
+                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
+                     code, reason ? reason : "OK", type, (unsigned)len);
+    send_all(fd, hdr, (size_t)h);
+    if (body && len) send_all(fd, body, len);
+}
+
 static void respond(int fd, const char *type, const char *body, size_t len)
 {
-    char hdr[256];
-    int h = snprintf(hdr, sizeof hdr,
-                     "HTTP/1.1 200 OK\r\nContent-Type: %s\r\nContent-Length: %u\r\n"
-                     "Cache-Control: no-store\r\nConnection: close\r\n\r\n",
-                     type, (unsigned)len);
-    send_all(fd, hdr, (size_t)h);
-    send_all(fd, body, len);
+    respond_status(fd, 200, "OK", type, body, len);
 }
 
 static void respond_403(int fd)
@@ -835,6 +1110,16 @@ static void handle_cmd(int fd, const char *q)
             if (x < 0) x = 0;
             if (x > HB_LOUD_MAX) x = HB_LOUD_MAX;
             __atomic_store_n(&S.volume, x, __ATOMIC_RELAXED);
+            if (qget(q, "ui", v, sizeof v)) {
+                int u = atoi(v);
+                if (u < 0) u = 0;
+                if (u > 200) u = 200;
+                __atomic_store_n(&S.ui_vol, u, __ATOMIC_RELAXED);
+            } else {
+                int u = x <= 100 ? x : 100 + (x - 100) / 4;
+                if (u > 200) u = 200;
+                __atomic_store_n(&S.ui_vol, u, __ATOMIC_RELAXED);
+            }
             settings_save_soon();
         } else {
             r = bad;
@@ -1113,25 +1398,98 @@ static int token_ok(const char *tok, const char *host, const char *origin)
     return 1;
 }
 
+
+#define HB_STATE_DIR "/data/hearbridge"
+
+static int backup_dest(const char *where, char *dir, int max)
+{
+    if (!strcmp(where, "internal")) {
+        snprintf(dir, (size_t)max, "%s", HB_BACKUP_INTERNAL);
+        return 1;
+    }
+    if (!strcmp(where, "usb"))
+        return hb_backup_find_usb("/mnt", dir, max);
+    return 0;
+}
+
+static int read_post_body(int fd, char *req, size_t n, char *out, int outmax)
+{
+    char *eoh = strstr(req, "\r\n\r\n");
+    char cl[32];
+    int need = 0, have = 0;
+    if (!eoh) return -1;
+    eoh += 4;
+    cl[0] = 0;
+    hdr_get(strstr(req, "\r\n"), "Content-Length", cl, sizeof cl);
+    need = atoi(cl);
+    if (need < 0 || need > outmax - 1) return -1;
+    have = (int)(n - (size_t)(eoh - req));
+    if (have < 0) have = 0;
+    if (have > need) have = need;
+    if (have) memcpy(out, eoh, (size_t)have);
+    while (have < need) {
+        ssize_t r = recv(fd, out + have, (size_t)(need - have), 0);
+        if (r <= 0) break;
+        have += (int)r;
+    }
+    out[have] = 0;
+    return have == need ? have : -1;
+}
+
+/* Game icon from the console's appmeta, streamed as PNG (icon0.png can be
+ * larger than the reply buffer). The browser caches it for a week. The id is
+ * validated as a title id first, so it cannot walk out of appmeta. */
+static int send_gameicon(int fd, const char *id)
+{
+    static char buf[16384];
+    char path[96], hdr[200];
+    struct stat st;
+    FILE *f = NULL;
+    int i, h;
+    long left;
+    if (!valid_title(id)) return 0;
+    for (i = 0; i < 2 && !f; i++) {
+        snprintf(path, sizeof path, "%s%s/icon0.png",
+                 i == 0 ? "/user/appmeta/" : "/system_data/priv/appmeta/", id);
+        if (stat(path, &st) == 0 && st.st_size > 0 && st.st_size < 8 * 1024 * 1024)
+            f = fopen(path, "rb");
+    }
+    if (!f) return 0;
+    h = snprintf(hdr, sizeof hdr,
+                 "HTTP/1.1 200 OK\r\nContent-Type: image/png\r\nContent-Length: %ld\r\n"
+                 "Cache-Control: public, max-age=604800\r\nConnection: close\r\n\r\n",
+                 (long)st.st_size);
+    send_all(fd, hdr, (size_t)h);
+    left = (long)st.st_size;
+    while (left > 0) {
+        size_t r = fread(buf, 1, sizeof buf, f);
+        if (r == 0) break;
+        send_all(fd, buf, r);
+        left -= (long)r;
+    }
+    fclose(f);
+    return 1;
+}
+
 static void handle(int fd, int peer_loopback)
 {
     static char req[4096];
     static char body[32768];
     char host[72], origin[96], tok[48], qtok[48];
-    size_t n = 0;
+    size_t req_n = 0;
     char *path, *sp, *q, *hdrs;
     int post;
     uint64_t t0 = sceKernelGetProcessTime();
 
     g_conn_end = t0 + CONN_TOTAL_US;
-    while (n + 1 < sizeof req && sceKernelGetProcessTime() - t0 < REQ_READ_US) {
-        ssize_t r = recv(fd, req + n, sizeof req - 1 - n, 0);
+    while (req_n + 1 < sizeof req && sceKernelGetProcessTime() - t0 < REQ_READ_US) {
+        ssize_t r = recv(fd, req + req_n, sizeof req - 1 - req_n, 0);
         if (r <= 0) break;
-        n += (size_t)r;
-        req[n] = 0;
+        req_n += (size_t)r;
+        req[req_n] = 0;
         if (strstr(req, "\r\n\r\n")) break;
     }
-    req[n] = 0;
+    req[req_n] = 0;
     if (!strstr(req, "\r\n\r\n")) return;           /* incomplete or too slow */
     post = strncmp(req, "POST ", 5) == 0;
     if (strncmp(req, "GET ", 4) != 0 && !post) return;
@@ -1160,7 +1518,8 @@ static void handle(int fd, int peer_loopback)
         respond(fd, "image/png", (const char *)webui_icon192, sizeof webui_icon192);
     } else if (strcmp(path, "/icon-512.png") == 0) {
         respond(fd, "image/png", (const char *)webui_icon512, sizeof webui_icon512);
-    } else if (strcmp(path, "/apple-touch-icon.png") == 0 || strcmp(path, "/apple-touch-icon-precomposed.png") == 0) {
+    } else if (strcmp(path, "/apple-touch-icon.png") == 0 || strcmp(path, "/apple-touch-icon-precomposed.png") == 0 ||
+               strcmp(path, "/app-icon-180.png") == 0) {
         respond(fd, "image/png", (const char *)webui_icon180, sizeof webui_icon180);
     } else if (strcmp(path, "/log") == 0) {
         respond(fd, "text/html; charset=utf-8", k_log_html, sizeof k_log_html - 1);
@@ -1176,6 +1535,10 @@ static void handle(int fd, int peer_loopback)
         build_status(&b);
         if (b.ov) respond_503(fd);
         else respond(fd, "application/json", body, b.n);
+    } else if (strcmp(path, "/api/gameicon") == 0) {
+        char id[16];
+        if (!q || !qget(q, "id", id, sizeof id) || !send_gameicon(fd, id))
+            respond(fd, "text/plain", "no icon\n", 8);
     } else if (strcmp(path, "/api/cmd") == 0) {
         if (!token_ok(tok, host, origin)) respond_403(fd);
         else handle_cmd(fd, q ? q : "");
@@ -1192,6 +1555,344 @@ static void handle(int fd, int peer_loopback)
         int n = snprintf(r, sizeof r, "{\"ok\":true,\"version\":\"%s\"}", S.version);
         respond(fd, "application/json", r, (size_t)n);
         put_cmd(UI_CMD_STOP, NULL);
+    } else if (strcmp(path, "/api/devices") == 0) {
+        struct sb b = { body, 0, sizeof body, 0 };
+        int i;
+        char a[18];
+        lock();
+        sb_add(&b, "{\"devices\":[");
+        for (i = 0; i < S.nscan; i++) {
+            devices_addr_str(S.scan[i].addr, a);
+            sb_add(&b, "%s{\"addr\":", i ? "," : "");
+            sb_str(&b, a);
+            sb_add(&b, ",\"name\":");
+            sb_str(&b, S.scan[i].name);
+            sb_add(&b, ",\"kind\":\"%s\",\"rssi\":%d,\"cod\":%u}",
+                   cod_kind(S.scan[i].cod),
+                   S.scan[i].rssi == 127 ? 0 : S.scan[i].rssi,
+                   (unsigned)S.scan[i].cod);
+        }
+        sb_add(&b, "]}");
+        unlock();
+        if (b.ov) respond_503(fd);
+        else respond(fd, "application/json", body, b.n);
+    } else if (strcmp(path, "/api/saved") == 0) {
+        struct saved_dev sd[DEVICES_MAX];
+        int nsd = devices_load(sd), i, outn = 0;
+        struct sb b = { body, 0, sizeof body, 0 };
+        char a[18];
+        int used[DEVICES_MAX];
+        for (i = 0; i < DEVICES_MAX; i++) used[i] = 0;
+        sb_add(&b, "{\"devices\":[");
+        for (;;) {
+            int best = -1;
+            for (i = 0; i < nsd; i++)
+                if (!used[i] && cod_device_allowed(0, 1, sd[i].cod) &&
+                    (best < 0 || sd[i].seq > sd[best].seq)) best = i;
+            if (best < 0) break;
+            used[best] = 1;
+            devices_addr_str(sd[best].addr, a);
+            {
+                int is_cur = 0;
+                lock();
+                if (S.have_dev && !memcmp(sd[best].addr, S.dev_addr, 6)) is_cur = 1;
+                unlock();
+                sb_add(&b, "%s{\"addr\":", outn ? "," : "");
+                sb_str(&b, a);
+                sb_add(&b, ",\"name\":");
+                sb_str(&b, sd[best].name);
+                sb_add(&b, ",\"kind\":\"%s\",\"current\":%d}",
+                       cod_kind(sd[best].cod), is_cur);
+            }
+            outn++;
+        }
+        sb_add(&b, "]}");
+        if (b.ov) respond_503(fd);
+        else respond(fd, "application/json", body, b.n);
+    } else if (strcmp(path, "/api/blocked") == 0) {
+        char skip[SKIP_MAX][10];
+        int nskip = skip_load(skip), i;
+        struct sb b = { body, 0, sizeof body, 0 };
+        sb_add(&b, "{\"blocked\":[");
+        for (i = 0; i < nskip; i++) {
+            sb_add(&b, "%s{\"addr\":", i ? "," : "");
+            sb_str(&b, skip[i]);
+            sb_add(&b, ",\"auto\":0}");
+        }
+        sb_add(&b, "]}");
+        if (b.ov) respond_503(fd);
+        else respond(fd, "application/json", body, b.n);
+    } else if (post && (
+               !strcmp(path, "/api/scan") || !strcmp(path, "/api/disconnect") ||
+               !strcmp(path, "/api/stop") || !strcmp(path, "/api/select") ||
+               !strcmp(path, "/api/connect") || !strcmp(path, "/api/forget") ||
+               !strcmp(path, "/api/volume") || !strcmp(path, "/api/headset") ||
+               !strcmp(path, "/api/eq") || !strcmp(path, "/api/game") ||
+               !strcmp(path, "/api/block") || !strcmp(path, "/api/adapter") ||
+               !strcmp(path, "/api/mute") || !strcmp(path, "/api/night") ||
+               !strcmp(path, "/api/tone") || !strcmp(path, "/api/clean") ||
+               !strcmp(path, "/api/latency") || !strcmp(path, "/api/codec") ||
+               !strcmp(path, "/api/keyvol"))) {
+        char mapped[192];
+        if (!token_ok(tok, host, origin)) { respond_403(fd); return; }
+        mapped[0] = 0;
+        if (!strcmp(path, "/api/scan"))
+            snprintf(mapped, sizeof mapped, "c=scan");
+        else if (!strcmp(path, "/api/disconnect"))
+            snprintf(mapped, sizeof mapped, "c=disconnect");
+        else if (!strcmp(path, "/api/stop"))
+            snprintf(mapped, sizeof mapped, "c=stop");
+        else if (!strcmp(path, "/api/select") || !strcmp(path, "/api/connect")) {
+            char addr[24];
+            if (q && qget(q, "addr", addr, sizeof addr))
+                snprintf(mapped, sizeof mapped, "c=connect&addr=%s", addr);
+            else
+                snprintf(mapped, sizeof mapped, "c=connect");
+        } else if (!strcmp(path, "/api/forget")) {
+            char addr[24];
+            if (q && qget(q, "addr", addr, sizeof addr))
+                snprintf(mapped, sizeof mapped, "c=forget&addr=%s", addr);
+        } else if (!strcmp(path, "/api/volume")) {
+            char v[16], ui[16];
+            if (q && qget(q, "pct", v, sizeof v)) {
+                if (qget(q, "ui", ui, sizeof ui))
+                    snprintf(mapped, sizeof mapped, "c=volume&v=%s&ui=%s", v, ui);
+                else
+                    snprintf(mapped, sizeof mapped, "c=volume&v=%s", v);
+            }
+        } else if (!strcmp(path, "/api/headset")) {
+            char v[16];
+            if (q && qget(q, "vol", v, sizeof v)) {
+                int x = atoi(v);
+                if (x < 0) x = 0;
+                if (x > 127) x = 127;
+                x = (x * 100 + 63) / 127;
+                snprintf(mapped, sizeof mapped, "c=hsvol&v=%d", x);
+            }
+        } else if (!strcmp(path, "/api/eq")) {
+            snprintf(mapped, sizeof mapped, "c=eq%s%s", q && q[0] ? "&" : "", q ? q : "");
+        } else if (!strcmp(path, "/api/game")) {
+            char v[16], id[16];
+            if (q && qget(q, "do", v, sizeof v)) {
+                if (v[0] == '1') snprintf(mapped, sizeof mapped, "c=gsave");
+                else if (v[0] == '2') snprintf(mapped, sizeof mapped, "c=gamemode&on=1");
+                else if (v[0] == '3') {
+                    if (qget(q, "id", id, sizeof id))
+                        snprintf(mapped, sizeof mapped, "c=gdel&id=%s", id);
+                    else
+                        snprintf(mapped, sizeof mapped, "c=gdel");
+                } else if (v[0] == '4') snprintf(mapped, sizeof mapped, "c=gamemode&on=0");
+            }
+        } else if (!strcmp(path, "/api/block")) {
+            char on[8], addr[24];
+            if (q && qget(q, "on", on, sizeof on) && qget(q, "addr", addr, sizeof addr))
+                snprintf(mapped, sizeof mapped, "c=%s&id=%s",
+                         on[0] == '1' ? "skip_add" : "skip_del", addr);
+        } else if (!strcmp(path, "/api/adapter")) {
+            char mode[24], node[24], word[24];
+            word[0] = 0;
+            if (q && qget(q, "mode", mode, sizeof mode)) snprintf(word, sizeof word, "%s", mode);
+            else if (q && qget(q, "node", node, sizeof node)) snprintf(word, sizeof word, "%s", node);
+            if (word[0] && hb_adapter_pref_set(word)) {
+                put_cmd(UI_CMD_REOPEN, NULL);
+                respond(fd, "application/json", "{\"ok\":true}", 11);
+            } else {
+                respond(fd, "application/json", "{\"ok\":false}", 12);
+            }
+            return;
+        } else if (!strcmp(path, "/api/mute")) {
+            char on[8];
+            if (q && qget(q, "on", on, sizeof on)) S.muted = on[0] != '0';
+            else S.muted = !S.muted;
+            respond(fd, "application/json", "{\"ok\":true}", 11);
+            return;
+        } else if (!strcmp(path, "/api/tone")) {
+            char on[8];
+            if (q && qget(q, "on", on, sizeof on)) S.tone = on[0] != '0';
+            else S.tone = !S.tone;
+            if (!S.tone) S.tone_phase = 0;
+            respond(fd, "application/json", "{\"ok\":true}", 11);
+            return;
+        } else if (!strcmp(path, "/api/night")) {
+            char on[8];
+            if (q && qget(q, "on", on, sizeof on)) S.night_on = on[0] != '0';
+            else S.night_on = !S.night_on;
+            respond(fd, "application/json", "{\"ok\":true}", 11);
+            return;
+        } else if (!strcmp(path, "/api/keyvol")) {
+            char on[8];
+            if (q && qget(q, "on", on, sizeof on)) S.key_vol = on[0] != '0';
+            else S.key_vol = !S.key_vol;
+            respond(fd, "application/json", "{\"ok\":true}", 11);
+            return;
+        } else if (!strcmp(path, "/api/clean")) {
+            int k;
+            lock();
+            S.eq_on = 0;
+            S.night_on = 0;
+            S.muted = 0;
+            S.tone = 0;
+            S.tone_phase = 0;
+            for (k = 0; k < HB_EQ_NB; k++) S.eq_db[k] = 0;
+            S.volume = 100;
+            eq_bump_locked();
+            unlock();
+            settings_save_soon();
+            respond(fd, "application/json", "{\"ok\":true}", 11);
+            return;
+        } else if (!strcmp(path, "/api/codec")) {
+            char mode[8];
+            if (q && qget(q, "mode", mode, sizeof mode)) {
+                int m = atoi(mode), oldm, avail;
+                if (m < 0) m = 0;
+                if (m > 3) m = 3;
+                lock();
+                avail = S.codec_avail;
+                /* HQ / XQ only when this headset advertised them. */
+                if (m >= 2 && !(avail & (1 << m))) {
+                    unlock();
+                    respond(fd, "application/json",
+                            "{\"ok\":false,\"error\":\"not supported by this headset\"}", 52);
+                    return;
+                }
+                oldm = S.codec_pref;
+                S.codec_pref = m;
+                unlock();
+                settings_save_soon();
+                /* Codec is negotiated at AVDTP setup: reconnect so the new
+                 * preference actually changes the live stream. */
+                if (m != oldm && (S.streaming || S.have_dev)) {
+                    unsigned char addr[6];
+                    lock();
+                    memcpy(addr, S.dev_addr, 6);
+                    unlock();
+                    put_cmd(UI_CMD_DISCONNECT, NULL);
+                    put_cmd(UI_CMD_CONNECT, addr);
+                }
+            }
+            respond(fd, "application/json", "{\"ok\":true}", 11);
+            return;
+        } else if (!strcmp(path, "/api/latency")) {
+            char v[16];
+            if (q && qget(q, "auto", v, sizeof v)) {
+                S.lat_auto = v[0] != '0';
+                if (S.lat_auto && S.lat_auto_ms <= 0) S.lat_auto_ms = S.lat_ms > 0 ? S.lat_ms : 200;
+            } else if (q && qget(q, "ms", v, sizeof v)) {
+                int ms = atoi(v);
+                if (ms < 40) ms = 40;
+                if (ms > 400) ms = 400;
+                S.lat_ms = ms;
+                S.lat_auto = 0;
+            }
+            respond(fd, "application/json", "{\"ok\":true}", 11);
+            return;
+        } else {
+            respond(fd, "application/json", "{\"ok\":false}", 12);
+            return;
+        }
+        if (!mapped[0]) respond(fd, "application/json", "{\"ok\":false}", 12);
+        else handle_cmd(fd, mapped);
+    } else if (post && !strcmp(path, "/api/backup")) {
+        static char big[HB_BACKUP_MAX + 512];
+        char where[24], dir[160], name[48];
+        int n;
+        if (!token_ok(tok, host, origin)) { respond_403(fd); return; }
+        where[0] = 0;
+        if (q) qget(q, "where", where, sizeof where);
+        if (!strcmp(where, "download")) {
+            n = hb_backup_make(HB_STATE_DIR, S.version[0] ? S.version : "1.2.0",
+                               (long)time(NULL), big, (int)sizeof big);
+            if (n <= 0)
+                respond_status(fd, 500, "Error", "application/json",
+                               "{\"error\":\"read\"}", 16);
+            else
+                respond(fd, "application/json", big, (size_t)n);
+        } else if (!strcmp(where, "internal") || !strcmp(where, "usb")) {
+            if (!backup_dest(where, dir, sizeof dir)) {
+                n = snprintf(big, sizeof big,
+                             "{\"where\":\"%s\",\"avail\":0,\"files\":[]}", where);
+                respond_status(fd, 409, "Conflict", "application/json", big, (size_t)n);
+            } else if (!hb_backup_save(HB_STATE_DIR, dir,
+                                       S.version[0] ? S.version : "1.2.0",
+                                       (long)time(NULL), name, sizeof name)) {
+                respond_status(fd, 500, "Error", "application/json",
+                               "{\"error\":\"write\"}", 17);
+            } else {
+                n = snprintf(big, sizeof big,
+                             "{\"ok\":1,\"name\":\"%s\",\"dir\":\"%s\"}", name, dir);
+                respond(fd, "application/json", big, (size_t)n);
+                ui_log(!strcmp(where, "usb") ? "Backup saved to USB" : "Backup saved on the console");
+            }
+        } else {
+            respond(fd, "application/json", "{\"ok\":false}", 12);
+        }
+    } else if (post && !strcmp(path, "/api/restore")) {
+        static char big[HB_BACKUP_MAX + 512];
+        char where[24], dir[160], name[48];
+        int n = -1;
+        if (!token_ok(tok, host, origin)) { respond_403(fd); return; }
+        where[0] = 0; name[0] = 0;
+        if (q) {
+            qget(q, "where", where, sizeof where);
+            qget(q, "name", name, sizeof name);
+        }
+        if (!strcmp(where, "upload")) {
+            int bl = read_post_body(fd, req, req_n, big, (int)sizeof big);
+            if (bl <= 0) {
+                respond_status(fd, 400, "Bad Request", "application/json",
+                               "{\"error\":\"no file\"}", 19);
+                return;
+            }
+            n = hb_backup_restore_text(HB_STATE_DIR, big);
+        } else if (!backup_dest(where, dir, sizeof dir)) {
+            n = snprintf(big, sizeof big,
+                         "{\"where\":\"%s\",\"avail\":0,\"files\":[]}", where);
+            respond_status(fd, 409, "Conflict", "application/json", big, (size_t)n);
+            return;
+        } else if (!hb_backup_name_ok(name)) {
+            respond_status(fd, 400, "Bad Request", "application/json",
+                           "{\"error\":\"bad parameter\"}", 25);
+            return;
+        } else {
+            n = hb_backup_restore(HB_STATE_DIR, dir, name);
+        }
+        if (n <= 0) {
+            respond_status(fd, 400, "Bad Request", "application/json",
+                           "{\"error\":\"not a HearBridge backup\"}", 35);
+        } else {
+            int l = snprintf(big, sizeof big, "{\"ok\":1,\"files\":%d}", n);
+            settings_load();
+            games_load();
+            respond(fd, "application/json", big, (size_t)l);
+            ui_log("Settings restored");
+        }
+    } else if (!strcmp(path, "/api/backups")) {
+        static char big[HB_BACKUP_MAX + 512];
+        char where[24], dir[160];
+        char names[HB_BACKUP_KEEP][HB_BACKUP_NAME];
+        int k, l, cnt;
+        where[0] = 0;
+        if (q) qget(q, "where", where, sizeof where);
+        if (!where[0]) snprintf(where, sizeof where, "usb");
+        if (!backup_dest(where, dir, sizeof dir)) {
+            l = snprintf(big, sizeof big,
+                         "{\"where\":\"%s\",\"avail\":0,\"files\":[]}", where);
+            respond(fd, "application/json", big, (size_t)l);
+        } else {
+            cnt = hb_backup_list(dir, names, HB_BACKUP_KEEP);
+            l = snprintf(big, sizeof big,
+                         "{\"where\":\"%s\",\"avail\":1,\"dir\":\"%s\",\"files\":[",
+                         where, dir);
+            for (k = 0; k < cnt && l > 0 && l < (int)sizeof big - 120; k++) {
+                char when[24];
+                hb_backup_when(names[k], when, sizeof when);
+                l += snprintf(big + l, sizeof big - (size_t)l,
+                              "%s{\"name\":\"%s\",\"when\":\"%s\"}",
+                              k ? "," : "", names[k], when);
+            }
+            l += snprintf(big + l, sizeof big - (size_t)l, "]}");
+            respond(fd, "application/json", big, (size_t)l);
+        }
     } else {
         respond_404(fd);
     }

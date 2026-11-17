@@ -1,8 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* SDP server (Core Vol 3 Part B). Developed by X-F1REBALL-X.
  * Copied from HearBridge-PS5 src/a2dp/sdp_server.c; PS4 probe keeps only
- * the A2DP Source, AVRCP Target + Controller (absolute volume) and
- * Device ID (PnP) records. */
+ * the A2DP Source, AVRCP Target + Controller (absolute volume),
+ * Device ID (PnP) and HFP AG (battery) records. */
 #include "sdp_server.h"
 
 #include <string.h>
@@ -103,11 +103,30 @@ static const sdp_attr di_a[] = {
 };
 static const unsigned di_u[] = { 0x1200, 0x1002 };
 
+/* HFP Audio Gateway on RFCOMM channel 1 — battery only (see hfp.c). */
+#define HFP_RFCOMM_CHANNEL 1
+static const unsigned char ag_h[]  = { H32(0x00010005) };
+static const unsigned char ag_cl[] = { 0x35, 6, UU(0x111F), UU(0x1203) };
+static const unsigned char ag_pd[] = { 0x35, 12, 0x35, 3, UU(0x0100),
+                                       0x35, 5, UU(0x0003), 0x08, HFP_RFCOMM_CHANNEL };
+static const unsigned char ag_pf[] = { 0x35, 8, 0x35, 6, UU(0x111E), U16(0x0108) };
+static const unsigned char ag_nm[] = { 0x25, 13, 'V','o','i','c','e',' ','G','a','t','e','w','a','y' };
+static const unsigned char ag_net[] = { 0x08, 0x00 };
+static const unsigned char ag_ft[] = { U16(0x0000) };
+static const sdp_attr ag_a[] = {
+    { 0x0000, ag_h, sizeof ag_h }, { 0x0001, ag_cl, sizeof ag_cl },
+    { 0x0004, ag_pd, sizeof ag_pd }, { 0x0005, browse, sizeof browse },
+    { 0x0009, ag_pf, sizeof ag_pf }, { 0x0100, ag_nm, sizeof ag_nm },
+    { 0x0301, ag_net, sizeof ag_net }, { 0x0311, ag_ft, sizeof ag_ft },
+};
+static const unsigned ag_u[] = { 0x111F, 0x1203, 0x0100, 0x0003, 0x111E, 0x1002 };
+
 static const sdp_record records[] = {
     { 0x00010001, src_a, 7, src_u, 5 },
     { 0x00010002, tg_a, 6, tg_u, 5 },
     { 0x00010003, ct_a, 6, ct_u, 5 },
     { 0x00010004, di_a, 10, di_u, 2 },
+    { 0x00010005, ag_a, 8, ag_u, 6 },
 };
 #define NREC ((int)(sizeof records / sizeof records[0]))
 

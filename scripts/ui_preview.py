@@ -128,4 +128,4 @@ class H(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-HTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 8090), H).serve_forever()
+HTTPServer(("127.0.0.1", int(sys.argv[1]) if len(sys.argv) > 1 else 6767), H).serve_forever()

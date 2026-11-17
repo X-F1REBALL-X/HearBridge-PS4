@@ -81,8 +81,8 @@ void btchip_describe(int vid, int pid, char *out, int cap)
     if (vid < 0 || vid > 0xffff || pid < 0 || pid > 0xffff) { out[0] = 0; return; }
     /* Common Cambridge Silicon Radio Bluetooth 4.0 stick (plain HCI). */
     if (vid == BTCHIP_VID_CSR && pid == 0x0001)
-        snprintf(out, (size_t)cap, "CSR8510 (%04x:%04x)", vid, pid);
-    else if (v) snprintf(out, (size_t)cap, "%s (%04x:%04x)", v, vid, pid);
+        snprintf(out, (size_t)cap, "CSR8510");
+    else if (v) snprintf(out, (size_t)cap, "%s", v);
     else        snprintf(out, (size_t)cap, "%04x:%04x", vid, pid);
 }
 

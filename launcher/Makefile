@@ -5,10 +5,10 @@
 # copied from that toolchain at build time; they are not part of this repository.
 
 TITLE       ?= HearBridge
-VERSION     := 1.1.0
+VERSION     := 1.2.0
 # param.sfo wants "xx.yy" (two digits each side) for APP_VER; VERSION (master
 # version) of a full app is 01.00.
-APP_VER     := 01.01
+APP_VER     := 01.20
 TITLE_ID    ?= HRBG40001
 CONTENT_ID  ?= IV0000-HRBG40001_00-HEARBRIDGEPS4000
 CATEGORY    ?= gd
@@ -30,6 +30,9 @@ OUT    ?= ../build/launcher
 STAGE  := $(OUT)/stage
 DAEMON_ELF := ../build/hearbridge_ps4_payload.elf
 TAP_PRX    := ../build/hearbridge_game_tap.prx
+DAEMON_PRX := ../build/hearbridge_daemon.prx
+BOOT_PRX   := ../build/hearbridge_boot.prx
+USBD_SPRX  := ../assets/libSceUsbd.sprx
 DAEMON_VERSION := $(shell sed -n 's/^\#define PROBE_VERSION "\(.*\)"/\1/p' ../src/probe.c)
 BUILD_ID ?= $(shell sh ../scripts/build_id.sh)
 
@@ -42,7 +45,8 @@ LDFLAGS := -m elf_x86_64 -pie --script $(TC)/link.x --eh-frame-hdr -L$(TC)/lib $
 
 STAGE_FILES := eboot.bin sce_sys/param.sfo sce_sys/icon0.png sce_sys/pic1.png \
                sce_sys/about/right.sprx sce_module/libc.prx sce_module/libSceFios2.prx \
-               hearbridge_ps4_payload.elf hearbridge_game_tap.prx
+               hearbridge_ps4_payload.elf hearbridge_game_tap.prx hearbridge_daemon.prx \
+               hearbridge_boot.prx libSceUsbd.sprx
 
 .PHONY: all
 all: $(OUT)/$(CONTENT_ID).pkg
@@ -53,7 +57,7 @@ $(OUT)/build_id: FORCE
 	@echo '$(BUILD_ID)' | cmp -s - $@ || echo '$(BUILD_ID)' > $@
 FORCE:
 
-$(OUT)/main.o: main.c install.h addr.h Makefile ../src/probe.c $(OUT)/build_id
+$(OUT)/main.o: main.c install.h addr.h Makefile ../src/probe.c ../src/daemon_main.h $(OUT)/build_id
 	@mkdir -p $(OUT)
 	clang $(CFLAGS) -c -o $@ $<
 
@@ -61,7 +65,18 @@ $(OUT)/install.o: install.c install.h Makefile
 	@mkdir -p $(OUT)
 	clang $(CFLAGS) -c -o $@ $<
 
-$(OUT)/launcher.elf: $(OUT)/main.o $(OUT)/install.o
+# In-process daemon (firmware where BinLoader receives but does not run ELFs).
+DAEMON_SRC := ../src/probe.c ../src/sdp_server.c ../src/sbc_enc.c ../src/linkkeys.c \
+	../src/pcm_udp.c ../src/devices.c ../src/webui.c ../src/avrcp.c ../src/eq.c \
+	../src/btchip.c ../src/realtek_fw.c ../src/hci_cmd_sync.c ../src/host_bdaddr.c \
+	../src/adapter_pref.c ../src/backup.c ../src/hfp.c
+DAEMON_CFLAGS := $(CFLAGS) -I../src -DHEARBRIDGE_PAYLOAD=1 -DHEARBRIDGE_PLUGIN=1 -DHEARBRIDGE_EBOOT=1 -DHB_BUILD='"$(BUILD_ID)"'
+$(OUT)/daemon_%.o: ../src/%.c
+	@mkdir -p $(OUT)
+	clang $(DAEMON_CFLAGS) -c -o $@ $<
+DAEMON_OBJS := $(patsubst ../src/%.c,$(OUT)/daemon_%.o,$(DAEMON_SRC))
+
+$(OUT)/launcher.elf: $(OUT)/main.o $(OUT)/install.o $(DAEMON_OBJS)
 	ld.lld $^ -o $@ $(LDFLAGS)
 
 $(STAGE)/eboot.bin: $(OUT)/launcher.elf
@@ -91,6 +106,18 @@ $(STAGE)/hearbridge_game_tap.prx: $(TAP_PRX)
 	@mkdir -p $(STAGE)
 	cp $< $@
 
+$(STAGE)/hearbridge_daemon.prx: $(DAEMON_PRX)
+	@mkdir -p $(STAGE)
+	cp $< $@
+
+$(STAGE)/hearbridge_boot.prx: $(BOOT_PRX)
+	@mkdir -p $(STAGE)
+	cp $< $@
+
+$(STAGE)/libSceUsbd.sprx: $(USBD_SPRX)
+	@mkdir -p $(STAGE)
+	cp $< $@
+
 
 
 stage-static:
@@ -103,7 +130,8 @@ stage-static:
 	cp $(SYS_FIOS2) $(STAGE)/sce_module/libSceFios2.prx
 
 $(OUT)/$(CONTENT_ID).pkg: $(STAGE)/eboot.bin $(STAGE)/sce_sys/param.sfo $(STAGE)/hearbridge_ps4_payload.elf \
-                          $(STAGE)/hearbridge_game_tap.prx \
+                          $(STAGE)/hearbridge_game_tap.prx $(STAGE)/hearbridge_daemon.prx \
+                          $(STAGE)/hearbridge_boot.prx $(STAGE)/libSceUsbd.sprx \
                           sce_sys/icon0.png sce_sys/pic1.png
 	$(MAKE) stage-static
 	cd $(STAGE) && rm -f pkg.gp4 && $(BIN)/create-gp4 -out pkg.gp4 --content-id=$(CONTENT_ID) --files "$(STAGE_FILES)"
