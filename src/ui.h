@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* HearBridge PS4 web UI: shared status, command queue and HTTP server
- * (port 6767). The HTTP server runs in its own thread;
+ * (port 8090). The HTTP server runs in its own thread;
  * the daemon updates status through ui_* setters and polls commands with
  * ui_take_cmd(). All shared data is guarded by one tiny spinlock. */
 #ifndef HEARBRIDGE_UI_H

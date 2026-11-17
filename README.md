@@ -68,7 +68,7 @@ There are two packages on the [Releases](https://github.com/X-F1REBALL-X/HearBri
 1. Install the package for your firmware with GoldHEN's package installer. A **HearBridge** tile appears on the home screen.
 2. In the GoldHEN settings, turn on **Plugin Loader** (and **BinLoader server** if you use the 13.52 package).
 3. Plug the dongle into the PS4 and open the **HearBridge** tile. It copies the plugins into `/data/GoldHEN/plugins`, adds them to `plugins.ini` and starts the service.
-4. Open **http://&lt;console-ip&gt;:6767** on a phone or PC on the same network. Or press OK on the tile message and then X (Circle if your console is set that way) to open the page in the PS4 browser.
+4. Open **http://&lt;console-ip&gt;:8090** on a phone or PC on the same network. Or press OK on the tile message and then X (Circle if your console is set that way) to open the page in the PS4 browser.
 5. Press **Scan for devices**, put your headphones in pairing mode and tap **Pair**. Only headphones, earbuds and speakers show up in the list, so if yours are missing, make sure they are really in pairing mode.
 6. Start a game. The sound plays on your headphones.
 

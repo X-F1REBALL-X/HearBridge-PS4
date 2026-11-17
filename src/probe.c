@@ -19,7 +19,7 @@
  * ACL credits, pacing resyncs instead of bursting after a stall, and the
  * bitpool is capped at 45 and lowered on congestion. A new daemon asks a
  * running one to stop (UDP 9500, /data/hearbridge/quit, /api/quit) and takes
- * over. The web UI (port 6767, or 6768) covers status, scan, pair, saved
+ * over. The web UI (port 8090, or 8091) covers status, scan, pair, saved
  * devices, volume, Boost, equalizer and game profiles. The target is the
  * pick in the UI, else the override file, else the last used saved device.
  * The current state is kept in /data/hearbridge/state.
@@ -4526,8 +4526,8 @@ static int http_local(int port, const char *path, char *buf, int max)
     return got > 0;
 }
 
-/* Web UI: 6767, waiting up to ~10 s for an old instance to let go of it;
- * 6768 if it stays taken. */
+/* Web UI: 8090, waiting up to ~10 s for an old instance to let go of it;
+ * 8091 if it stays taken. */
 static void start_ui(void)
 {
     static const int ports[2] = { UI_PORT, UI_PORT_ALT };
