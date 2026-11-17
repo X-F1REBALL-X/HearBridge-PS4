@@ -13,7 +13,9 @@ Developed by **X-F1REBALL-X**
 
 HearBridge PS4 plays your PS4's game audio on ordinary Bluetooth headphones, earbuds or speakers. The console cannot do this by itself, so HearBridge drives a small USB Bluetooth dongle (CSR8510 or Realtek RTL8761BU) and streams to any A2DP headset. You control everything from a web page served by the console, on a phone, a PC or the PS4 browser. It is the first Bluetooth audio solution for the PS4.
 
-<img src="docs/img/showcase.png" alt="HearBridge PS4 on a phone and in a desktop browser: devices, sound, equalizer and game profiles" width="100%">
+<img src="docs/img/showcase.png" alt="HearBridge PS4 home page in a desktop browser and on a phone" width="100%">
+
+<img src="docs/img/pages.png" alt="Headsets page and Sound and games page" width="100%">
 
 ## Downloads
 
@@ -22,7 +24,7 @@ There are two packages on the [Releases](https://github.com/X-F1REBALL-X/HearBri
 | Package | Works on |
 |---|---|
 | `HearBridge-PS4-1.2.0-for-14.xx.pkg` | All firmwares, including 14.00 to 14.02. Use this one if you are not sure. |
-| `HearBridge-PS4-1.2.0-for-13.52.pkg` | 13.52 and older. Runs the service through BinLoader from the home screen. |
+| `HearBridge-PS4-1.2.0-up-to-13.52.pkg` | Up to 13.52. Runs the service through BinLoader from the home screen. |
 
 ## What it does
 
@@ -74,7 +76,7 @@ HearBridge keeps running after the tile closes and reconnects to your last headp
 
 ## How the 14.xx package works
 
-On 13.52 the launcher sends the HearBridge service to GoldHEN's BinLoader and it runs in the background. On 14.00 to 14.02 GoldHEN's BinLoader accepts the file but never runs it, so that path is dead. GoldHEN plugins still work there, so the 14.xx package uses them instead. This works on every firmware GoldHEN supports:
+On 13.52 the launcher sends the HearBridge service to GoldHEN's BinLoader and it runs in the background. GoldHEN does not officially support 14.00 to 14.02 yet. On those firmwares its BinLoader accepts the file but never runs it, so that path is dead. GoldHEN plugins still work there, so the 14.xx package uses them instead. This works on every firmware GoldHEN supports:
 
 - `hearbridge_game_tap.prx` picks up the game's audio, same as before.
 - `hearbridge_boot.prx` loads with every game and starts the service (`hearbridge_daemon.prx`) inside the game process.
