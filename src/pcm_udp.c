@@ -8,7 +8,10 @@
 #include <string.h>
 #include <unistd.h>
 
-#ifdef HEARBRIDGE_PAYLOAD
+/* BinLoader ELF payload uses BSD sockets. GoldHEN plugin daemon must use
+ * sceNet — game_tap sends via sceNet, and the two stacks do not share
+ * loopback on Orbis (pcm_rx stays 0 with BSD bind). */
+#if defined(HEARBRIDGE_PAYLOAD) && !defined(HEARBRIDGE_PLUGIN)
 #include <arpa/inet.h>
 #include <netinet/in.h>
 #include <sys/socket.h>
@@ -32,9 +35,24 @@ static int stop_seen;
  * resamples by a tiny ratio (linear interpolation, at most +-0.5 %) chosen
  * by a PI controller on the smoothed fill level, which holds the buffer
  * near JB_TARGET_FRAMES without audible drops or resyncs. */
-#define JB_PRIME_FRAMES  2400  /* 50 ms */
+#define JB_PRIME_FRAMES  2400  /* 50 ms floor before first read */
 #define JB_HIGH_FRAMES   8640  /* 180 ms: hard trim (should not happen now) */
-#define JB_TARGET_FRAMES 3360  /* 70 ms */
+#define JB_TARGET_DEFAULT 3360 /* 70 ms: the adaptive/Auto default */
+/* Jitter-buffer target in 48 kHz frames. The UI latency control sets this
+ * at stream start (Auto keeps the default); the PI controller then holds the
+ * ring near it, so a bigger target really is a bigger safety buffer. */
+static int jb_target = JB_TARGET_DEFAULT;
+void pcm_udp_set_target_ms(int ms)
+{
+    int f;
+    if (ms < 20) ms = 20;
+    if (ms > 190) ms = 190;      /* keep headroom under RING_FRAMES (200 ms) */
+    f = ms * 48;                 /* 48 frames per ms at 48 kHz */
+    if (f < JB_PRIME_FRAMES) f = JB_PRIME_FRAMES;
+    if (f > JB_HIGH_FRAMES) f = JB_HIGH_FRAMES;
+    jb_target = f;
+}
+int pcm_udp_target_ms(void) { return jb_target / 48; }
 #define DRIFT_MAX_PPM    5000.0
 #define DRIFT_KP         2.0    /* ppm per frame of fill error */
 #define DRIFT_KI         0.004  /* ppm per frame of error, per read */
@@ -75,13 +93,14 @@ static void rx_pcm(const unsigned char *buf, int n)
         n_rx_frames += (unsigned long)frames;
         ring_push((const int16_t *)(const void *)buf, frames);
     }
-}         /* resampler phase, 0..65535 between ring[r_r] and next */
+}
+         /* resampler phase, 0..65535 between ring[r_r] and next */
 
 static void ring_push(const int16_t *s, int frames)
 {
     int i;
     if (r_count / 2 + frames > JB_HIGH_FRAMES) {
-        int drop = r_count / 2 + frames - JB_TARGET_FRAMES;
+        int drop = r_count / 2 + frames - jb_target;
         if (drop > r_count / 2) drop = r_count / 2;
         r_r = (r_r + drop * 2) % RING_SAMPLES;
         r_count -= drop * 2;
@@ -110,7 +129,16 @@ static int is_stop_cmd(const unsigned char *p, int n)
     return 0;
 }
 
-#ifdef HEARBRIDGE_PAYLOAD
+void pcm_udp_feed(const void *data, int nbytes)
+{
+    const unsigned char *buf = (const unsigned char *)data;
+    if (!buf || nbytes <= 0) return;
+    if (is_stop_cmd(buf, nbytes)) { stop_seen = 1; return; }
+    if (is_hello(buf, nbytes)) return;
+    rx_pcm(buf, nbytes);
+}
+
+#if defined(HEARBRIDGE_PAYLOAD) && !defined(HEARBRIDGE_PLUGIN)
 
 int pcm_udp_open_port(int port)
 {
@@ -237,8 +265,20 @@ int pcm_udp_open_port(int port)
     drift_i = drift_ppm = 0.0;
     rs_frac = 0;
 
+    n_rx_pkts = n_rx_frames = n_hello = 0;
+    tap_title[0] = 0;
+    tap_pkts = 0;
+    g_port = port;
+
     sock = sceNetSocket("hb_pcm", ORBIS_NET_AF_INET, ORBIS_NET_SOCK_DGRAM, 0);
     if (sock < 0) return -1;
+    {
+        int nbio = 1;
+#ifndef SCE_NET_SO_NBIO
+#define SCE_NET_SO_NBIO 0x1200
+#endif
+        (void)sceNetSetsockopt(sock, SCE_NET_SOL_SOCKET, SCE_NET_SO_NBIO, &nbio, sizeof nbio);
+    }
     (void)one;
 
     memset(&a, 0, sizeof a);
@@ -246,7 +286,6 @@ int pcm_udp_open_port(int port)
     a.sin_family = ORBIS_NET_AF_INET;
     a.sin_port = __builtin_bswap16((uint16_t)port);
     a.sin_addr.s_addr = __builtin_bswap32(0x7f000001u); /* 127.0.0.1 */
-    g_port = port;
 
     if (sceNetBind(sock, (const OrbisNetSockaddr *)&a, sizeof a) < 0) {
         sceNetSocketClose(sock);
@@ -289,7 +328,7 @@ int pcm_udp_poll(void)
 
     if (sock < 0) return stop_seen;
     for (;;) {
-        n = sceNetRecvfrom(sock, buf, sizeof buf, 0x40 /* MSG_DONTWAIT if available */,
+        n = sceNetRecvfrom(sock, buf, sizeof buf, 0x80 /* MSG_DONTWAIT */,
                            NULL, NULL);
         if (n == (int)SCE_NET_ERROR_EAGAIN || n < 0) break;
         if (n == 0) continue;
@@ -337,7 +376,7 @@ int pcm_udp_read_s16(int16_t *out, int max_frames)
     /* PI controller on the smoothed fill level. Positive ppm: read faster. */
     if (fill_ema < 0) fill_ema = (double)fill;
     fill_ema += ((double)fill - fill_ema) / 32.0;
-    e = fill_ema - (double)JB_TARGET_FRAMES;
+    e = fill_ema - (double)jb_target;
     drift_i += e * DRIFT_KI;
     if (drift_i > DRIFT_I_MAX) drift_i = DRIFT_I_MAX;
     if (drift_i < -DRIFT_I_MAX) drift_i = -DRIFT_I_MAX;

@@ -172,7 +172,9 @@ static inline int hb_gp_differs(const hb_gp *g, int eq_on, const int db[HB_GP_EQ
 {
     int i;
     if (g->boost != boost || (g->eq_on != 0) != (eq_on != 0)) return 1;
-    if (eq_on) for (i = 0; i < HB_GP_EQ; i++) if (g->eq_db[i] != db[i]) return 1;
+    /* Compare bands even when EQ is off, so Quick presets / Custom light
+     * Update Game Profile as soon as the saved curve differs. */
+    for (i = 0; i < HB_GP_EQ; i++) if (g->eq_db[i] != db[i]) return 1;
     return 0;
 }
 

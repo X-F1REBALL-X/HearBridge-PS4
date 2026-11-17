@@ -13,7 +13,7 @@
 #include <stdint.h>
 
 #define HB_LOUD_MAX      500         /* boost slider, percent; 100 = unchanged, 500 = x5 */
-#define HB_LOUD_DEFAULT  180         /* about +5 dB: louder than the game gives */
+#define HB_LOUD_DEFAULT  100         /* unified volume meter starts at 100% */
 
 /* Gain in 1/256 steps for a loudness percentage (0..HB_LOUD_MAX). */
 static inline int32_t hb_gain_q8(int pct)

@@ -29,7 +29,7 @@ LIBS_TEST  := -lGoldHEN_Hook -lkernel -lc -lSceLibcInternal
 LDFLAGS_BASE := -m elf_x86_64 -pie -e _init --script $(OO_PS4_TOOLCHAIN)/link.x --eh-frame-hdr \
 	-L$(OO_PS4_TOOLCHAIN)/lib -L$(GOLDHEN_SDK)
 
-.PHONY: all clean sdk audio test game game-min game-steps
+.PHONY: all clean sdk audio test game game-min game-steps daemon boot
 
 all: sdk game game-min game-steps audio test
 
@@ -39,6 +39,8 @@ sdk:
 
 game:  sdk $(OUT)/hearbridge_game_tap.prx
 game-min: sdk $(OUT)/hearbridge_game_min.prx
+daemon: sdk $(OUT)/hearbridge_daemon.prx
+boot: sdk $(OUT)/hearbridge_boot.prx
 game-steps: sdk $(OUT)/hearbridge_step1.prx $(OUT)/hearbridge_step2.prx
 audio: $(OUT)/shell_audio_tap.prx
 test:  $(OUT)/shell_tap_test.prx
@@ -99,10 +101,49 @@ $(INTDIR):
 $(OUT):
 	mkdir -p $@
 
+# HearBridge daemon as a GoldHEN plugin (firmware 14.02 BinLoader workaround).
+DAEMON_SRC := ../src/probe.c ../src/sdp_server.c ../src/sbc_enc.c ../src/linkkeys.c \
+	../src/pcm_udp.c ../src/devices.c ../src/webui.c ../src/avrcp.c ../src/eq.c \
+	../src/btchip.c ../src/realtek_fw.c ../src/hci_cmd_sync.c ../src/host_bdaddr.c \
+	../src/adapter_pref.c ../src/backup.c ../src/hfp.c
+DAEMON_CFLAGS := $(GAME_CFLAGS) -O2 -I../src -DHEARBRIDGE_PAYLOAD=1 -DHEARBRIDGE_PLUGIN=1 \
+	-DHB_BUILD='"plugin"'
+LIBS_DAEMON := -lSceLibcInternal -lGoldHEN_Hook -lkernel -lSceSysmodule -lSceNet -lc
+
+$(INTDIR)/hearbridge_daemon_wrap.o: hearbridge_daemon.c hb_plugin_common.h ../src/daemon_main.h | $(INTDIR)
+	$(CC) $(DAEMON_CFLAGS) -c -o $@ hearbridge_daemon.c
+
+$(INTDIR)/daemon_%.o: ../src/%.c | $(INTDIR)
+	$(CC) $(DAEMON_CFLAGS) -c -o $@ $<
+
+DAEMON_OBJS := $(INTDIR)/hearbridge_daemon_wrap.o \
+	$(patsubst ../src/%.c,$(INTDIR)/daemon_%.o,$(DAEMON_SRC))
+
+$(OUT)/hearbridge_daemon.elf: $(DAEMON_OBJS) $(GOLDHEN_SDK)/build/crtprx.o $(GOLDHEN_SDK)/libGoldHEN_Hook.a | $(OUT)
+	$(LD) $(GOLDHEN_SDK)/build/crtprx.o $(DAEMON_OBJS) -o $@ $(LDFLAGS_BASE) $(LIBS_DAEMON)
+
+$(OUT)/hearbridge_daemon.prx: $(OUT)/hearbridge_daemon.elf
+	OO_PS4_TOOLCHAIN=$(OO_PS4_TOOLCHAIN) $(OO_PS4_TOOLCHAIN)/bin/linux/create-fself -in=$< -out=$(OUT)/hearbridge_daemon.oelf \
+		--lib=$@ --paid 0x3800000000000011
+
+
+$(INTDIR)/hearbridge_boot.o: hearbridge_boot.c hb_plugin_common.h | $(INTDIR)
+	$(CC) $(GAME_CFLAGS) -c -o $@ $<
+
+$(OUT)/hearbridge_boot.elf: $(INTDIR)/hearbridge_boot.o $(GOLDHEN_SDK)/build/crtprx.o $(GOLDHEN_SDK)/libGoldHEN_Hook.a | $(OUT)
+	$(LD) $(GOLDHEN_SDK)/build/crtprx.o $(INTDIR)/hearbridge_boot.o -o $@ $(LDFLAGS_BASE) $(LIBS_GAME) -lSceNet
+
+$(OUT)/hearbridge_boot.prx: $(OUT)/hearbridge_boot.elf
+	OO_PS4_TOOLCHAIN=$(OO_PS4_TOOLCHAIN) $(OO_PS4_TOOLCHAIN)/bin/linux/create-fself -in=$< -out=$(OUT)/hearbridge_boot.oelf \
+		--lib=$@ --paid 0x3800000000000011
+
 clean:
 	rm -rf $(INTDIR)
 	rm -f $(OUT)/hearbridge_step*.elf $(OUT)/hearbridge_step*.oelf $(OUT)/hearbridge_step*.prx
 	rm -f $(OUT)/hearbridge_game_min.elf $(OUT)/hearbridge_game_min.oelf $(OUT)/hearbridge_game_min.prx
+	rm -f $(OUT)/hearbridge_boot.elf $(OUT)/hearbridge_boot.oelf $(OUT)/hearbridge_boot.prx
+	rm -f $(OUT)/hearbridge_daemon.elf $(OUT)/hearbridge_daemon.oelf $(OUT)/hearbridge_daemon.prx
+	rm -f $(INTDIR)/hearbridge_daemon_wrap.o $(INTDIR)/daemon_*.o
 	rm -f $(OUT)/hearbridge_game_tap.elf $(OUT)/hearbridge_game_tap.oelf $(OUT)/hearbridge_game_tap.prx
 	rm -f $(OUT)/shell_audio_tap.elf $(OUT)/shell_audio_tap.oelf $(OUT)/shell_audio_tap.prx
 	rm -f $(OUT)/shell_tap_test.elf $(OUT)/shell_tap_test.oelf $(OUT)/shell_tap_test.prx

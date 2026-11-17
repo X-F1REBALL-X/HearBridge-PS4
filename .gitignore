@@ -2,3 +2,8 @@ build/
 
 src/shell_audio_tap_prx.h
 src/shell_tap_test_prx.h
+
+# Console system module, shipped only inside the release package
+assets/libSceUsbd.sprx
+src/web/*.bak-old
+src/web/*.new-ui

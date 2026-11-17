@@ -199,6 +199,10 @@ static net_socket_fn p_sceNetSocket;
 static net_setsockopt_fn p_sceNetSetsockopt;
 static net_sendto_fn p_sceNetSendto;
 static net_close_fn p_sceNetSocketClose;
+typedef int32_t (*hb_pcm_feed_fn)(const void *, size_t);
+static hb_pcm_feed_fn p_hb_pcm_feed;
+static uint8_t g_feed_neg[1024];
+static uint64_t g_feed_last_try;
 
 static int g_sock = -1;
 static int g_sock_state;             /* atomic: 0 none, 2 ok, 3 failed (worker retries) */
@@ -346,6 +350,26 @@ static int slot_claim(void)
 static void send_pcm(const int16_t *pcm, uint32_t frames)
 {
     uint32_t off = 0;
+
+    /* Prefer in-process feed into hearbridge_daemon (same game process). */
+    if (p_hb_pcm_feed) {
+        while (off < frames) {
+            uint32_t n = frames - off;
+            int32_t rc;
+            if (n > PKT_FRAMES)
+                n = PKT_FRAMES;
+            rc = p_hb_pcm_feed(pcm + off * 2, (size_t)n * 4u);
+            if (rc < 0) {
+                A_ADD(&g_pkts_dropped, 1);
+                g_last_send_err = rc;
+            } else {
+                A_ADD(&g_pkts_sent, 1);
+                A_ADD(&g_frames_sent, n);
+            }
+            off += n;
+        }
+        return;
+    }
 
     if (A_LOAD(&g_sock_state) != 2 || !p_sceNetSendto)
         return;
@@ -1070,6 +1094,20 @@ static void *logger_main(void *arg)
                 snprintf(buf, sizeof buf, "[%llu ms] daemon %s: tap %s\n",
                          (unsigned long long)(now / 1000), on ? "streaming" : "not streaming",
                          on ? "active" : "paused");
+                log_line(buf, 0);
+            }
+        }
+        /* Resolve hb_pcm_feed from hearbridge_daemon once it is loaded. */
+        if (A_LOAD(&g_daemon_on) && !p_hb_pcm_feed &&
+            (g_feed_last_try == 0 || now - g_feed_last_try >= 2000000ull)) {
+            void *a = NULL;
+            int32_t h;
+            g_feed_last_try = now;
+            h = find_export("hb_pcm_feed", &a, g_feed_neg);
+            if (h >= 0 && a) {
+                p_hb_pcm_feed = (hb_pcm_feed_fn)a;
+                snprintf(buf, sizeof buf, "[%llu ms] hb_pcm_feed resolved in module 0x%x\n",
+                         (unsigned long long)(now / 1000), (unsigned)h);
                 log_line(buf, 0);
             }
         }

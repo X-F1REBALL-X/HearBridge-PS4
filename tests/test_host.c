@@ -442,22 +442,22 @@ static void test_launcher_addr(void)
     CHECK(hb_ip_ok("192.0.2.10") && hb_ip_ok("192.0.2.7"));
     CHECK(!hb_ip_ok("127.0.0.1") && !hb_ip_ok("0.0.0.0") && !hb_ip_ok("") && !hb_ip_ok("abc") &&
           !hb_ip_ok("300.1.1.1") && !hb_ip_ok("1.2.3") && !hb_ip_ok("1.2.3.4.5"));
-    hb_ui_text(t, sizeof t, "", "192.0.2.10", 8090, "1.0.0", "X", "Circle");
-    CHECK(strstr(t, "http://192.0.2.10:8090") && strstr(t, "127.0.0.1:8090") && t[0] == 'H');
+    hb_ui_text(t, sizeof t, "", "192.0.2.10", 6767, "1.0.0", "X", "Circle");
+    CHECK(strstr(t, "http://192.0.2.10:6767") && strstr(t, "127.0.0.1:6767") && t[0] == 'H');
     CHECK(strstr(t, "Press X to open the page in the PS4 web browser.\nPress Circle to close, HearBridge keeps running."));
     CHECK(strstr(t, "Yes") == NULL && strstr(t, "No closes") == NULL);
-    CHECK(strstr(t, "\nA Bluetooth USB dongle (CSR8510) must be plugged into the PS4.\n") != NULL && strlen(t) < 450);
+    CHECK(strstr(t, "\nA CSR8510 or Realtek RTL8761BU USB dongle must be plugged into the PS4.\n") != NULL && strlen(t) < 450);
     CHECK(strstr(t, "First press OK. Then:\nPress X to open") != NULL);       /* the pad is blind while the message is up */
     CHECK(strncmp(t, "HearBridge 1.0.0 is running.\n", 29) == 0);                 /* version in the first line */
     CHECK(strstr(t, "Developed by") == NULL && strstr(t, "F1REBALL") == NULL);   /* the name is on the splash only */
-    hb_ui_text(t, sizeof t, "Game audio plugin installed.", "192.0.2.10", 8091, "1.0.0", "X", "Circle");
-    CHECK(strncmp(t, "Game audio plugin installed.\n\n", 30) == 0 && strstr(t, ":8091"));
-    hb_ui_text(t, sizeof t, "", "127.0.0.1", 8090, "1.0.0", "X", "Circle");
-    CHECK(strstr(t, "<console address>:8090") != NULL && strstr(t, "HearBridge 1.0.0 is running") &&
+    hb_ui_text(t, sizeof t, "Game audio plugin installed.", "192.0.2.10", 6768, "1.0.0", "X", "Circle");
+    CHECK(strncmp(t, "Game audio plugin installed.\n\n", 30) == 0 && strstr(t, ":6768"));
+    hb_ui_text(t, sizeof t, "", "127.0.0.1", 6767, "1.0.0", "X", "Circle");
+    CHECK(strstr(t, "<console address>:6767") != NULL && strstr(t, "HearBridge 1.0.0 is running") &&
           strstr(t, "Developed by") == NULL);                          /* no usable address: say so */
-    hb_ui_text(t, 40, "x", "192.0.2.10", 8090, "1.0.0", "X", "Circle");                              /* tiny buffer: no overflow */
+    hb_ui_text(t, 40, "x", "192.0.2.10", 6767, "1.0.0", "X", "Circle");                              /* tiny buffer: no overflow */
     CHECK(strlen(t) < 40);
-    hb_ui_text(t, sizeof t, "", "192.0.2.10", 8090, "1.0.0", "Circle", "X");              /* Asian button assignment */
+    hb_ui_text(t, sizeof t, "", "192.0.2.10", 6767, "1.0.0", "Circle", "X");              /* Asian button assignment */
     CHECK(strstr(t, "Press Circle to open the page in the PS4 web browser.\nPress X to close") != NULL);
 }
 
@@ -616,7 +616,7 @@ static void test_boost(void)
 
     /* slider percent to gain */
     CHECK(hb_gain_q8(100) == 256 && hb_gain_q8(0) == 0 && hb_gain_q8(50) == 128);
-    CHECK(hb_gain_q8(HB_LOUD_DEFAULT) > 256);                /* the default is louder than before */
+    CHECK(HB_LOUD_DEFAULT == 100 && hb_gain_q8(HB_LOUD_DEFAULT) == 256); /* the meter starts at 100% */
     CHECK(HB_LOUD_MAX == 500 && hb_gain_q8(HB_LOUD_MAX) == 1280 && hb_gain_q8(999) == 1280 && hb_gain_q8(-5) == 0);
     {   /* x5 on a full-scale square wave: limited, never wraps, stays below full scale */
         static int16_t sq[64];
@@ -654,12 +654,12 @@ static void test_boost(void)
     hb_apply_gain(out, N, 128);
     for (ok = 1, i = 0; i < N; i++) if (abs(out[i] - in[i] / 2) > 1) ok = 0;
     CHECK(ok);
-    /* a quiet game signal gets clearly louder at the default (180 %) and at 280 %, undistorted
+    /* a quiet game signal gets clearly louder at 180 % and at 280 %, undistorted
      * (amplitude 6000 x 1.8 stays under the knee: exactly linear) */
     for (i = 0; i < N; i++) b[i] = (int16_t)(6000.0 * sin(2 * M_PI * 1000.0 * i / 48000.0));
     memcpy(out, b, sizeof b);
-    hb_apply_gain(out, N, hb_gain_q8(HB_LOUD_DEFAULT));
-    for (ok = 1, i = 0; i < N; i++) if (out[i] != (int16_t)(((int32_t)b[i] * hb_gain_q8(HB_LOUD_DEFAULT)) >> 8)) ok = 0;
+    hb_apply_gain(out, N, hb_gain_q8(180));
+    for (ok = 1, i = 0; i < N; i++) if (out[i] != (int16_t)(((int32_t)b[i] * hb_gain_q8(180)) >> 8)) ok = 0;
     CHECK(ok);
     for (rin = rout = 0, i = 0; i < N; i++) { rin += (double)b[i] * b[i]; rout += (double)out[i] * out[i]; }
     CHECK(sqrt(rout / rin) > 1.75);
@@ -871,7 +871,7 @@ static void test_gprof(void)
         CHECK(!hb_gp_differs(&g, 1, same, 180));
         CHECK(hb_gp_differs(&g, 1, other, 180) && hb_gp_differs(&g, 1, same, 190) && hb_gp_differs(&g, 0, same, 180));
         g.eq_on = 0;
-        CHECK(!hb_gp_differs(&g, 0, other, 180));        /* bands do not matter while the EQ is off */
+        CHECK(hb_gp_differs(&g, 0, other, 180) && !hb_gp_differs(&g, 0, same, 180)); /* saved bands count even with the EQ off */
     }
     /* what a change of the running game means */
     CHECK(hb_gm_decide("", "") == HB_GM_KEEP && hb_gm_decide("CUSA00001", "CUSA00001") == HB_GM_KEEP);

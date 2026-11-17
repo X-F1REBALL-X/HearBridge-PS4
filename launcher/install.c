@@ -1,7 +1,8 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
-/* HearBridge launcher: installs the game audio plugin and its GoldHEN
- * settings. Every step is logged; nothing is removed, and the original
- * plugins.ini / config.ini are kept as .bak (once) before the first edit. */
+/* HearBridge launcher: installs GoldHEN plugins for game audio (14.02 path).
+ * Copies game_tap, boot, daemon, and libSceUsbd into /data/GoldHEN/plugins/,
+ * ensures plugins.ini [default] lists game_tap + boot, and turns on
+ * PluginLoader_Enabled. Original plugins.ini / config.ini kept as .bak once. */
 #include "install.h"
 
 #include <ctype.h>
@@ -12,15 +13,31 @@
 #include <unistd.h>
 
 #ifndef HB_ROOT
-#define HB_ROOT      ""          /* root prefix for all paths; empty on the console */
+#define HB_ROOT      ""
 #endif
-#define TAP_SRC      HB_ROOT "/app0/hearbridge_game_tap.prx"
 #define GH_DIR       HB_ROOT "/data/GoldHEN"
 #define PLUGIN_DIR   GH_DIR "/plugins"
-#define TAP_DST      PLUGIN_DIR "/hearbridge_game_tap.prx"
 #define TAP_LOG_DIR  GH_DIR "/hearbridge"
 #define PLUGINS_INI  GH_DIR "/plugins.ini"
 #define CONFIG_INI   GH_DIR "/config.ini"
+
+struct install_file {
+    const char *src;
+    const char *dst;
+    const char *tag;
+};
+
+static const struct install_file k_files[] = {
+    { HB_ROOT "/app0/hearbridge_game_tap.prx", PLUGIN_DIR "/hearbridge_game_tap.prx", "game_tap" },
+    { HB_ROOT "/app0/hearbridge_boot.prx",     PLUGIN_DIR "/hearbridge_boot.prx",     "boot" },
+    { HB_ROOT "/app0/hearbridge_daemon.prx",   PLUGIN_DIR "/hearbridge_daemon.prx",   "daemon" },
+    { HB_ROOT "/app0/libSceUsbd.sprx",         PLUGIN_DIR "/libSceUsbd.sprx",         "usbd" },
+};
+
+static const char *const k_ini_lines[] = {
+    "/data/GoldHEN/plugins/hearbridge_game_tap.prx",
+    "/data/GoldHEN/plugins/hearbridge_boot.prx",
+};
 
 static void (*L)(const char *fmt, ...);
 
@@ -44,7 +61,7 @@ static unsigned char *slurp(const char *path, size_t *len)
         n += r;
     } while (r > 0);
     fclose(f);
-    buf[n] = 0;                 /* text callers get a terminated string */
+    buf[n] = 0;
     *len = n;
     return buf;
 }
@@ -57,7 +74,6 @@ static int file_exists(const char *p)
     return 1;
 }
 
-/* Write via path.tmp, flushed to disk, then rename. 0 ok. */
 static int write_atomic(const char *path, const void *d, size_t n)
 {
     char tmp[256];
@@ -67,18 +83,17 @@ static int write_atomic(const char *path, const void *d, size_t n)
     if (!(f = fopen(tmp, "wb"))) return -1;
     ok = fwrite(d, 1, n, f) == n;
     if (ok && fflush(f) != 0) ok = 0;
-    /* (fileno) calls the function: the stdio macro would read a data symbol
-     * that the console libc does not provide. */
     if (ok && fsync((fileno)(f)) != 0) ok = 0;
     if (fclose(f) != 0) ok = 0;
     if (!ok || rename(tmp, path) != 0) {
         unlink(tmp);
         return -1;
     }
+    /* LoadStartModule needs +x; fopen creates 0666 and games get EACCES (0x8002000d). */
+    chmod(path, 0777);
     return 0;
 }
 
-/* Copy path to path.bak unless a backup exists already. */
 static void backup_once(const char *path, const unsigned char *d, size_t n)
 {
     char bak[256];
@@ -98,35 +113,44 @@ static unsigned fnv1a(const unsigned char *d, size_t n)
     return h;
 }
 
-/* ---- plugin file ---- */
-static int install_plugin(void)
+static int install_one_file(const struct install_file *f)
 {
     size_t sl = 0, dl = 0;
-    unsigned char *src = slurp(TAP_SRC, &sl), *dst;
+    unsigned char *src = slurp(f->src, &sl), *dst;
     int rc;
     if (!src || sl == 0) {
-        L("plugin: cannot read %s", TAP_SRC);
+        L("%s: cannot read %s", f->tag, f->src);
         free(src);
         return -1;
     }
-    dst = slurp(TAP_DST, &dl);
+    dst = slurp(f->dst, &dl);
     if (dst && dl == sl && memcmp(src, dst, sl) == 0) {
-        L("plugin: %s up to date (%zu bytes, fnv %08x)", TAP_DST, sl, fnv1a(src, sl));
+        L("%s: %s up to date (%zu bytes, fnv %08x)", f->tag, f->dst, sl, fnv1a(src, sl));
+        chmod(f->dst, 0777);
         free(src);
         free(dst);
         return 0;
     }
-    if (dst) L("plugin: %s differs (%zu bytes fnv %08x -> %zu bytes fnv %08x), replacing", TAP_DST, dl,
-               fnv1a(dst, dl), sl, fnv1a(src, sl));
-    else L("plugin: %s missing, installing (%zu bytes, fnv %08x)", TAP_DST, sl, fnv1a(src, sl));
-    rc = write_atomic(TAP_DST, src, sl);
-    L("plugin: write %s", rc == 0 ? "ok" : "FAILED");
+    if (dst) L("%s: %s differs (%zu -> %zu bytes), replacing", f->tag, f->dst, dl, sl);
+    else L("%s: %s missing, installing (%zu bytes, fnv %08x)", f->tag, f->dst, sl, fnv1a(src, sl));
+    rc = write_atomic(f->dst, src, sl);
+    L("%s: write %s", f->tag, rc == 0 ? "ok" : "FAILED");
     free(src);
     free(dst);
     return rc == 0 ? 1 : -1;
 }
 
-/* ---- ini helpers ---- */
+static int install_plugin_files(void)
+{
+    int i, worst = 0, rc;
+    for (i = 0; i < (int)(sizeof k_files / sizeof k_files[0]); i++) {
+        rc = install_one_file(&k_files[i]);
+        if (rc < 0) worst = -1;
+        else if (rc > 0 && worst >= 0) worst = 1;
+    }
+    return worst;
+}
+
 static void trim(const char *b, const char *e, const char **ob, const char **oe)
 {
     while (b < e && (*b == ' ' || *b == '\t' || *b == '\r' || (unsigned char)*b == 0xEF ||
@@ -152,25 +176,58 @@ static int span_ieq(const char *b, const char *e, const char *s)
     return 1;
 }
 
-/* ---- plugins.ini ---- */
-static int ensure_plugins_ini(void)
+static int line_in_default(const char *txt, size_t n, const char *want)
 {
-    /* The line GoldHEN reads is always the console path. */
-    static const char want[] = "/data/GoldHEN/plugins/hearbridge_game_tap.prx";
+    const char *p;
+    int in_default = 0;
+    for (p = txt; p < txt + n;) {
+        const char *le = memchr(p, '\n', (size_t)(txt + n - p));
+        const char *next = le ? le + 1 : txt + n, *b, *e;
+        if (!le) le = txt + n;
+        trim(p, le, &b, &e);
+        if (b < e && *b == '[') {
+            in_default = 0;
+            {
+                const char *cb = b + 1, *ce = memchr(b, ']', (size_t)(e - b));
+                const char *tb, *te;
+                if (ce) {
+                    trim(cb, ce, &tb, &te);
+                    if (span_ieq(tb, te, "default")) in_default = 1;
+                }
+            }
+        } else if (in_default && b < e && *b != ';' && *b != '#') {
+            const char *ke = memchr(b, '=', (size_t)(e - b)), *tb, *te;
+            if (!ke) ke = e;
+            trim(b, ke, &tb, &te);
+            if (span_eq(tb, te, want)) return 1;
+        }
+        p = next;
+    }
+    return 0;
+}
+
+static int ensure_ini_line(const char *want)
+{
     size_t n = 0;
     char *txt = (char *)slurp(PLUGINS_INI, &n), *out;
     const char *p, *eol = "\n";
-    const char *ins_at = NULL;      /* insert after this point (end of [default] content) */
-    int in_default = 0, have_default = 0, found = 0;
+    const char *ins_at = NULL;
+    int in_default = 0, have_default = 0;
     size_t on = 0, cap;
     int rc;
 
     if (!txt) {
-        static const char fresh[] = "[default]\n/data/GoldHEN/plugins/hearbridge_game_tap.prx\n";
-        L("plugins.ini: missing, creating with [default] %s", want);
-        rc = write_atomic(PLUGINS_INI, fresh, sizeof fresh - 1);
+        char fresh[256];
+        int fn = snprintf(fresh, sizeof fresh, "[default]\n%s\n", want);
+        L("plugins.ini: missing, creating with %s", want);
+        rc = write_atomic(PLUGINS_INI, fresh, (size_t)fn);
         L("plugins.ini: write %s", rc == 0 ? "ok" : "FAILED");
         return rc == 0 ? 1 : -1;
+    }
+    if (line_in_default(txt, n, want)) {
+        L("plugins.ini: [default] already has %s", want);
+        free(txt);
+        return 0;
     }
     if (strstr(txt, "\r\n")) eol = "\r\n";
     for (p = txt; p < txt + n;) {
@@ -193,30 +250,14 @@ static int ensure_plugins_ini(void)
                 }
             }
         } else if (in_default) {
-            if (b < e && *b != ';' && *b != '#') {
-                const char *kb = b, *ke = memchr(b, '=', (size_t)(e - b)), *tb, *te;
-                if (!ke) ke = e;
-                trim(kb, ke, &tb, &te);
-                if (span_eq(tb, te, want)) {
-                    found = 1;
-                    if (ke < e) L("plugins.ini: line present with a state: %.*s", (int)(e - b), b);
-                }
-                ins_at = next;      /* after the last entry of the section */
-            }
+            if (b < e && *b != ';' && *b != '#')
+                ins_at = next;
         }
         p = next;
     }
-    if (found) {
-        L("plugins.ini: [default] already has %s, unchanged", want);
-        free(txt);
-        return 0;
-    }
     backup_once(PLUGINS_INI, (unsigned char *)txt, n);
-    cap = n + sizeof want + 32;
-    if (!(out = malloc(cap))) {
-        free(txt);
-        return -1;
-    }
+    cap = n + strlen(want) + 64;
+    if (!(out = malloc(cap))) { free(txt); return -1; }
     if (have_default) {
         size_t head = (size_t)(ins_at - txt);
         memcpy(out, txt, head);
@@ -225,22 +266,32 @@ static int ensure_plugins_ini(void)
         on += (size_t)sprintf(out + on, "%s%s", want, eol);
         memcpy(out + on, txt + head, n - head);
         on += n - head;
-        L("plugins.ini: added %s to the existing [default] section", want);
+        L("plugins.ini: added %s to [default]", want);
     } else {
         memcpy(out, txt, n);
         on = n;
         if (n > 0 && out[n - 1] != '\n') on += (size_t)sprintf(out + on, "%s", eol);
         on += (size_t)sprintf(out + on, "%s[default]%s%s%s", n > 0 ? eol : "", eol, want, eol);
-        L("plugins.ini: no [default] section, appended one with %s", want);
+        L("plugins.ini: appended [default] with %s", want);
     }
     rc = write_atomic(PLUGINS_INI, out, on);
-    L("plugins.ini: write %s (%zu -> %zu bytes)", rc == 0 ? "ok" : "FAILED", n, on);
+    L("plugins.ini: write %s", rc == 0 ? "ok" : "FAILED");
     free(out);
     free(txt);
     return rc == 0 ? 1 : -1;
 }
 
-/* ---- config.ini: PluginLoader_Enabled ---- */
+static int ensure_plugins_ini(void)
+{
+    int i, worst = 0, rc;
+    for (i = 0; i < (int)(sizeof k_ini_lines / sizeof k_ini_lines[0]); i++) {
+        rc = ensure_ini_line(k_ini_lines[i]);
+        if (rc < 0) worst = -1;
+        else if (rc > 0 && worst >= 0) worst = 1;
+    }
+    return worst;
+}
+
 static int ensure_plugin_loader(void)
 {
     size_t n = 0;
@@ -286,14 +337,6 @@ static int ensure_plugin_loader(void)
                 free(txt);
                 return rc == 0 ? 1 : -1;
             }
-            {
-                const char *q;
-                for (q = kb; q + 9 <= ke; q++)
-                    if (span_ieq(q, q + 9, "BinLoader")) {
-                        L("config.ini: %.*s", (int)(e - b), b);
-                        break;
-                    }
-            }
         }
         p = next;
     }
@@ -310,9 +353,9 @@ void install_all(void (*logf)(const char *fmt, ...), struct install_result *r)
     mkdir(PLUGIN_DIR, 0777);
     mkdir(TAP_LOG_DIR, 0777);
     mkdir(HB_ROOT "/data/hearbridge", 0777);
-    r->plugin = install_plugin();
+    r->plugin = install_plugin_files();
     r->plugins_ini = ensure_plugins_ini();
     r->loader = ensure_plugin_loader();
-    L("install: plugin %d, plugins.ini %d, plugin loader %d "
+    L("install: files %d, plugins.ini %d, plugin loader %d "
       "(1 changed, 0 ok, -1 failed)", r->plugin, r->plugins_ini, r->loader);
 }

@@ -1,7 +1,9 @@
 /* SPDX-License-Identifier: GPL-3.0-or-later */
 /* hearbridge_ps4 - HearBridge PS4 daemon (see PROBE_VERSION).
  *
- * Drives a CSR8510 USB Bluetooth adapter (0A12:0001) through libSceUsbd,
+ * Drives a USB Bluetooth adapter (CSR8510 0A12:0001, or Realtek RTL8761BU
+ * and its rebadges) through libSceUsbd. Realtek sticks that boot in ROM
+ * mode get their patch uploaded the same way HearBridge PS5 does. Then it
  * keeps an A2DP Source stream open to a headset, and encodes PCM received
  * over UDP 127.0.0.1:9500 (48 kHz stereo s16le) to SBC. Silence is sent
  * when no PCM arrives. Link keys are persisted under /data/hearbridge/.
@@ -17,7 +19,7 @@
  * ACL credits, pacing resyncs instead of bursting after a stall, and the
  * bitpool is capped at 45 and lowered on congestion. A new daemon asks a
  * running one to stop (UDP 9500, /data/hearbridge/quit, /api/quit) and takes
- * over. The web UI (port 8090, or 8091) covers status, scan, pair, saved
+ * over. The web UI (port 6767, or 6768) covers status, scan, pair, saved
  * devices, volume, Boost, equalizer and game profiles. The target is the
  * pick in the UI, else the override file, else the last used saved device.
  * The current state is kept in /data/hearbridge/state.
@@ -46,9 +48,15 @@
 #include "hciframe.h"
 #include "ui.h"
 #include "avrcp.h"
+#include "hfp.h"
 #include "pager.h"
+#include "hci.h"
+#include "btchip.h"
+#include "adapter_pref.h"
+#include "realtek_fw.h"
+#include "host_bdaddr.h"
 
-#define PROBE_VERSION "1.0.0"
+#define PROBE_VERSION "1.2.0"
 #define LOG_PATH      "/data/hearbridge/daemon.log"
 #define LOG_PATH_ALT  "/user/data/hearbridge/daemon.log"
 #define TARGET_PATH   "/data/hearbridge_target.txt"
@@ -56,8 +64,10 @@
 #define STATE_PATH    "/data/hearbridge/state"
 #define STATE_PATH_ALT "/user/data/hearbridge/state"
 
-#define TARGET_VID 0x0A12
-#define TARGET_PID 0x0001
+#define CSR_VID 0x0A12
+#define CSR_PID 0x0001
+#define OP_SET_EVENT_FILTER   0x0C05
+#define OP_READ_LOCAL_FEATURES 0x1003
 
 
 #define POLL_MS          20      /* per endpoint read inside the pump */
@@ -96,6 +106,7 @@
 #define OP_CREATE_CONN_CANCEL 0x0408
 #define OP_ACCEPT_CONN        0x0409
 #define OP_REJECT_CONN        0x040A
+#define OP_REJECT_SYNC_CONN   0x042A   /* Reject Synchronous Connection Request */
 #define OP_LINK_KEY_REPLY     0x040B
 #define OP_LINK_KEY_NEG_REPLY 0x040C
 #define OP_PIN_CODE_REPLY     0x040D
@@ -108,6 +119,7 @@
 #define OP_SET_EVENT_MASK     0x0C01
 #define OP_RESET              0x0C03
 #define OP_WRITE_LOCAL_NAME   0x0C13
+#define OP_WRITE_CLASS_OF_DEV 0x0C24   /* Audio/Video COD like PS5 */
 #define OP_WRITE_PAGE_TIMEOUT 0x0C18
 #define OP_WRITE_SCAN_ENABLE  0x0C1A
 #define OP_WRITE_LINK_SUPV    0x0C37
@@ -122,6 +134,7 @@
 #define PSM_SDP       0x0001
 #define PSM_AVDTP     0x0019
 #define PSM_AVCTP     0x0017   /* AVRCP control (absolute volume) */
+#define PSM_RFCOMM    0x0003   /* HFP AG battery (see hfp.c) */
 #define L2_CMD_REJ    0x01
 #define L2_CONN_REQ   0x02
 #define L2_CONN_RSP   0x03
@@ -201,6 +214,7 @@
 #define ROLE_AVSIG  2
 #define ROLE_MEDIA  3
 #define ROLE_AVCTP  4
+#define ROLE_RFCOMM 5
 #define MAX_CH      8
 
 /* ---- libkernel (linked directly in both toolchains) ------------------ */
@@ -610,9 +624,15 @@ static void addr_str(const unsigned char a[6], char s[18])
 
 /* ---- module loading ---------------------------------------------------- */
 
+/* OrbisSysModule USBD = 0xB7; declared to avoid header path issues in plugin build. */
+int32_t sceSysmoduleLoadModule(int moduleId);
+
 static int load_usbd(void)
 {
     static const char *paths[] = {
+        /* Game sandbox cannot see /system; GoldHEN plugins dir is visible. */
+        "/data/GoldHEN/plugins/libSceUsbd.sprx",
+        "/data/hearbridge/libSceUsbd.sprx",
         "libSceUsbd.sprx",
         "/system/common/lib/libSceUsbd.sprx",
         "/system/priv/lib/libSceUsbd.sprx",
@@ -620,6 +640,11 @@ static int load_usbd(void)
     int32_t h = -1;
     unsigned i;
 
+    /* Prefer sysmodule when available (works from launcher / ShellUI). */
+    {
+        int32_t sm = sceSysmoduleLoadModule(0x00B7); /* ORBIS_SYSMODULE_USBD */
+        out("sceSysmoduleLoadModule(USBD) -> 0x%08x", (unsigned)sm);
+    }
     for (i = 0; i < sizeof paths / sizeof paths[0]; i++) {
         h = sceKernelLoadStartModule(paths[i], 0, NULL, 0, NULL, NULL);
         out("load %s -> 0x%08x", paths[i], (unsigned)h);
@@ -808,6 +833,12 @@ static struct {
 /* Kept across sessions (G is cleared per session). */
 static int g_ignore_saved_key;  /* headset rejected our key: pair fresh next time */
 static int g_end_reason = -1;   /* why the link ended: HCI reason from the headphones, 0x13 when they closed the stream, -1 unknown */
+/* Case close / power button (0x13) or remote power-off (0x15): stay disconnected.
+ * Out-of-range supervision timeout (0x08) is a drop that may rejoin. */
+static int drop_is_away(int reason)
+{
+    return reason == 0x13 || reason == 0x15;
+}
 static int g_session_streamed;  /* last session reached streaming */
 
 /* AVDTP state for our single local SEP. */
@@ -826,6 +857,8 @@ static struct {
 
 /* AVRCP absolute volume (src/avrcp.c), reset per session. */
 static avrcp_state AVR;
+static hfp_state HFP;
+static unsigned g_hfp_scid;
 static int g_hs_vol = -1;       /* last headphone level (0..127) seen this run */
 /* ---- transport --------------------------------------------------------- */
 
@@ -947,6 +980,86 @@ static struct {
     volatile long full_waits;
     void *thr;
 } EVT;
+
+/* Raw HCI events for hci_cmd_sync() (Realtek prepare and shared BD_ADDR).
+ * on_event() still runs; this is an extra copy while capture is on. */
+#define HCI_CAP_MAX 8
+static unsigned char g_cap_ev[HCI_CAP_MAX][HCI_PKT_MAX];
+static int g_cap_len[HCI_CAP_MAX];
+static int g_cap_n, g_cap_rd, g_cap_on;
+static void cap_push(const unsigned char *ev, int n)
+{
+    int i;
+    if (!g_cap_on || n < 2 || n > HCI_PKT_MAX) return;
+    if (g_cap_n >= HCI_CAP_MAX) return;
+    i = g_cap_n++;
+    memcpy(g_cap_ev[i], ev, (size_t)n);
+    g_cap_len[i] = n;
+}
+
+static int hci_wrap_cmd(void *self, unsigned op, const void *args, int nargs)
+{
+    (void)self;
+    return hci_send(op, args, nargs);
+}
+
+static int hci_wrap_pump(void *self, int wait_ms)
+{
+    long deadline = now_ms() + (wait_ms > 0 ? wait_ms : 0);
+    (void)self;
+    if (wait_ms <= 0) {
+        pump_once();
+        return g_cap_rd < g_cap_n;
+    }
+    while (now_ms() < deadline && !G.transport_dead) {
+        if (g_cap_rd < g_cap_n) return 1;
+        pump_once();
+    }
+    if (g_cap_rd < g_cap_n) return 1;
+    return G.transport_dead ? -1 : 0;
+}
+
+static int hci_wrap_next_event(void *self, unsigned char *dst, int cap)
+{
+    int n;
+    (void)self;
+    if (g_cap_rd >= g_cap_n) return 0;
+    n = g_cap_len[g_cap_rd];
+    if (n > cap) n = cap;
+    if (n > 0) memcpy(dst, g_cap_ev[g_cap_rd], (size_t)n);
+    g_cap_rd++;
+    if (g_cap_rd >= g_cap_n) g_cap_rd = g_cap_n = 0;
+    return n;
+}
+
+static int hci_wrap_next_acl(void *self, unsigned char *dst, int cap)
+{
+    (void)self; (void)dst; (void)cap;
+    return 0;
+}
+
+static const hci_ops g_hci_ops = {
+    .next_acl = hci_wrap_next_acl,
+    .next_event = hci_wrap_next_event,
+    .pump = hci_wrap_pump,
+    .cmd = hci_wrap_cmd,
+};
+
+static hci_t hci_live(void)
+{
+    hci_t h;
+    g_cap_rd = g_cap_n = 0;
+    g_cap_on = 1;
+    h.ctx = &H;
+    h.ops = &g_hci_ops;
+    return h;
+}
+
+static void hci_live_done(void)
+{
+    g_cap_on = 0;
+    g_cap_rd = g_cap_n = 0;
+}
 
 static void *evt_main(void *arg)
 {
@@ -1080,6 +1193,7 @@ static int cmd_aborts_session(const struct ui_cmd *c)
     case UI_CMD_SCAN:
     case UI_CMD_DISCONNECT:
     case UI_CMD_STOP:
+    case UI_CMD_REOPEN:
         return 1;
     case UI_CMD_CONNECT:
         return !(G.connected && memcmp(c->addr, G.peer, 6) == 0);
@@ -1382,6 +1496,7 @@ static const char *role_name(int role)
     case ROLE_AVSIG: return "AVDTP-sig";
     case ROLE_MEDIA: return "AVDTP-media";
     case ROLE_AVCTP: return "AVRCP";
+    case ROLE_RFCOMM:return "RFCOMM-HFP";
     default:         return "?";
     }
 }
@@ -1786,6 +1901,7 @@ static void on_event(const unsigned char *ev, int n)
     char astr[18];
 
     if (n < 2) return;
+    if (g_cap_on) cap_push(ev, n);
     if (ev[0] != 0x13) hexline("hci evt", ev, n);
 
     /* Command Complete (0x0E) */
@@ -1899,8 +2015,21 @@ static void on_event(const unsigned char *ev, int n)
         unsigned char rp[7];
         const char *why = NULL;
         addr_str(ev + 2, astr);
-        if (ev[11] != 0x01) why = "not an ACL link";
-        else if (G.connected) why = "already connected";
+        /* SCO/eSCO (call audio): refuse. HFP is battery-only. Match PS5:
+         * Reject Synchronous Connection Request when we already have ACL. */
+        if (ev[11] != 0x01) {
+            memcpy(rp, ev + 2, 6);
+            rp[6] = 0x0D;       /* limited resources */
+            if (G.connected && same_addr(ev + 2, G.peer)) {
+                hci_send(OP_REJECT_SYNC_CONN, rp, 7);
+                out("hfp: headset asked for call audio, refused");
+            } else {
+                hci_send(OP_REJECT_CONN, rp, 7);
+                out("incoming: %s cod 0x%06x rejected (not an ACL link)", astr, cod);
+            }
+            return;
+        }
+        if (G.connected) why = "already connected";
         else if (!mine && !G.accept_in) why = "not listening";
         else if (!mine && G.conn_pending) why = "busy paging another device";
         else if (mine ? !addr_allowed(ev + 2, cod) : !incoming_ok(ev + 2, cod))
@@ -2017,6 +2146,8 @@ static void on_signaling(const unsigned char *d, int len)
                     /* Second AVDTP channel after OPEN = media transport. */
                     role = (AV.opened && chan_find_role(ROLE_AVSIG, 1) &&
                             !chan_find_role(ROLE_MEDIA, 0)) ? ROLE_MEDIA : ROLE_AVSIG;
+                } else if (psm == PSM_RFCOMM) {
+                    role = chan_find_role(ROLE_RFCOMM, 0) ? 0 : ROLE_RFCOMM;
                 }
                 c = role ? chan_alloc(psm, role, 1) : NULL;
                 if (c) {
@@ -2366,6 +2497,34 @@ static void on_avdtp(struct chan *c, const unsigned char *d, int len)
     }
 }
 
+/* HFP AG over inbound RFCOMM: headset battery percent (see hfp.c). */
+static void hfp_tx(void *ud, const unsigned char *p, int n)
+{
+    struct chan *c = (struct chan *)ud;
+    (void)ud;
+    if (!c) c = chan_find_role(ROLE_RFCOMM, 1);
+    if (c && n > 0) l2_send(c->dcid, p, n);
+}
+static void hfp_say(const char *m) { out("%s", m); }
+static void on_rfcomm(struct chan *c, const unsigned char *d, int len)
+{
+    if (g_hfp_scid != c->scid) {
+        int keep_b = HFP.battery, keep_bs = HFP.battery_seq, keep_src = HFP.battery_src;
+        hfp_init(&HFP, hfp_tx, c, hfp_say);
+        /* Keep last % across RFCOMM reopen (codec reconnect). New peer
+         * already cleared the UI battery in ui_set_device. */
+        HFP.battery = keep_b;
+        HFP.battery_seq = keep_bs;
+        HFP.battery_src = keep_src;
+        g_hfp_scid = c->scid;
+        out("hfp: RFCOMM open (battery)");
+    }
+    HFP.ud = c;
+    hfp_input(&HFP, d, len);
+    if (HFP.battery >= 0)
+        ui_set_battery(-2, HFP.battery); /* -2 = HFP percent */
+}
+
 /* AVRCP control channel: absolute volume both ways (see avrcp.c). */
 static void avctp_send(const unsigned char *p, int n)
 {
@@ -2384,7 +2543,10 @@ static void on_avctp(struct chan *c, const unsigned char *d, int len)
         AVR.need_register = 0;
         avctp_send(r, avrcp_build_register_volume(&AVR, r, (int)sizeof r));
     }
-    AVR.need_batt = 0;          /* no battery display on PS4 yet */
+    if (AVR.need_batt) {
+        int bn = avrcp_build_register_battery(&AVR, r, (int)sizeof r);
+        if (bn > 0) avctp_send(r, bn);   /* clears need_batt, sets batt_tried */
+    }
 }
 
 /* 1 when the headphones take remote volume (the page shows the control). */
@@ -2424,6 +2586,7 @@ static void on_l2cap(unsigned cid, const unsigned char *d, int len)
     case ROLE_AVSIG: on_avdtp(c, d, len); break;
     case ROLE_MEDIA: G.media_rx++; break;
     case ROLE_AVCTP: on_avctp(c, d, len); break;
+    case ROLE_RFCOMM:on_rfcomm(c, d, len); break;
     default:         break;
     }
 }
@@ -2610,25 +2773,95 @@ static int load_target_override(unsigned char addr_out[6])
     return 1;
 }
 
+static int usb_vid_known(unsigned vid, unsigned pid)
+{
+    if (vid == CSR_VID && pid == CSR_PID) return 1; /* CSR8510 */
+    if (vid == 0x0bda) return 1;                    /* Realtek, incl. 8771 / B00C */
+    if (vid == 0x37ad || vid == 0x2357) return 1;   /* TP-Link (often RTL8761BU) */
+    if (vid == 0x0b05) return 1;                    /* ASUS (BT600 and similar) */
+    return 0;
+}
+
+static int usb_is_bt_hci_class(unsigned cls, unsigned sub, unsigned proto)
+{
+    (void)proto;
+    return cls == 0xE0 && sub == 0x01;
+}
+
+static int usb_stick_ok(const struct usb_dev_desc *d)
+{
+    if (!d) return 0;
+    if (usb_vid_known(d->idVendor, d->idProduct)) return 1;
+    return usb_is_bt_hci_class(d->bDeviceClass, d->bDeviceSubClass, d->bDeviceProtocol);
+}
+
+/* Proven CSR8510 mask from the original PS4 bring-up (no Extended Inquiry Result). */
+static const unsigned char g_evmask_csr[8] = {
+    0xFF, 0xFF, 0xFB, 0xFF, 0x07, 0xF8, 0xBF, 0x3D
+};
+/* Wider mask so mode-2 (EIR) result events arrive on Realtek and other sticks. */
+static const unsigned char g_evmask_wide[8] = {
+    0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xBF, 0x7D
+};
+
 static int setup_controller(void)
 {
     unsigned char r[64], p[248];
-    int n = 0;
-    char astr[18];
+    int n = 0, family = HB_BT_FAMILY_OTHER;
+    char why[192], astr[18];
+    const unsigned char *mask;
+    int is_csr, is_rtl;
+    hci_t hci;
 
     if (!hci_cmd_cc(OP_RESET, NULL, 0, r, sizeof r, &n) || r[0]) {
         say("FAIL: HCI Reset status 0x%02x", n > 0 ? r[0] : 0xFF);
         return 0;
     }
     say("HCI Reset: ok");
+    /* Give a ROM-mode Realtek time to be ready. Harmless on CSR. */
+    sceKernelUsleep(250 * 1000);
+
+    hci = hci_live();
+    if (!hb_rtl_prepare(hci, &family, why, (int)sizeof why)) {
+        hci_live_done();
+        say("FAIL: Realtek firmware: %s", why[0] ? why : "upload failed");
+        return 0;
+    }
+    is_csr = family == HB_BT_FAMILY_CSR;
+    is_rtl = family == HB_BT_FAMILY_REALTEK;
+    mask = is_csr ? g_evmask_csr : g_evmask_wide;
+    hci_live_done();
+
+    /* Event mask before inquiry mode. CSR keeps the proven PS4 mask. */
+    if (!hci_cmd_cc(OP_SET_EVENT_MASK, mask, 8, r, sizeof r, &n) || r[0])
+        out("Set_Event_Mask failed (continuing)");
+    else
+        out("Set_Event_Mask: %s", is_csr ? "CSR/PS4 0x3DBFF807FFFBFFFF" : "EIR 0x7DBFFFFFFFFFFFFF");
+
+    if (!is_csr) {
+        unsigned char filt = 0;
+        if (!hci_cmd_cc(OP_SET_EVENT_FILTER, &filt, 1, r, sizeof r, &n) || r[0])
+            out("Set_Event_Filter clear failed (continuing)");
+    }
+
+    /* Shared host address so a headset paired on one stick reconnects on the other.
+     * CSR PSKEY is saved without a warm reset (that dropped the USB pipe on PS5);
+     * Realtek gets the address in the firmware config. */
+    hci = hci_live();
+    hb_host_bdaddr_sync_usb(hci, is_csr, is_rtl);
+    hci_live_done();
 
     if (!hci_cmd_cc(OP_READ_BD_ADDR, NULL, 0, r, sizeof r, &n) || n < 7 || r[0]) {
-        say("FAIL: Read BD_ADDR");
+        say("FAIL: adapter USB went away after BD_ADDR sync");
         return 0;
     }
     memcpy(G.local_addr, r + 1, 6);
     addr_str(G.local_addr, astr);
     say("BD_ADDR: %s", astr);
+
+    /* Realtek firmware Reset clears the event mask; put it back. */
+    if (!hci_cmd_cc(OP_SET_EVENT_MASK, mask, 8, r, sizeof r, &n) || r[0])
+        out("Set_Event_Mask after BD_ADDR sync failed (continuing)");
 
     if (!hci_cmd_cc(OP_READ_LOCAL_VER, NULL, 0, r, sizeof r, &n) || n < 9 || r[0]) {
         say("FAIL: Read Local Version");
@@ -2637,9 +2870,21 @@ static int setup_controller(void)
     {
         unsigned hci_rev = (unsigned)(r[2] | (r[3] << 8));
         unsigned manuf = (unsigned)(r[5] | (r[6] << 8));
-        say("HCI %s rev 0x%04x, LMP %s, manuf 0x%04x%s",
+        const char *fam = btchip_family_name(family);
+        say("HCI %s rev 0x%04x, LMP %s, manuf 0x%04x%s%s%s",
             hci_ver_name(r[1]), hci_rev, hci_ver_name(r[4]), manuf,
-            manuf == 0x000A ? " (CSR)" : "");
+            manuf == 0x000A ? " (CSR)" : "",
+            fam && fam[0] ? " family " : "",
+            fam && fam[0] ? fam : "");
+    }
+
+    /* A Low Energy only stick cannot do A2DP. Features byte 4 bit 5:
+     * BR/EDR not supported. hci_cmd_cc return starts at the status byte. */
+    if (hci_cmd_cc(OP_READ_LOCAL_FEATURES, NULL, 0, r, sizeof r, &n) && n >= 9 && r[0] == 0) {
+        if (r[5] & 0x20) {
+            say("FAIL: this adapter has no Bluetooth Classic (BR/EDR); audio needs it");
+            return 0;
+        }
     }
 
     /* Return params: status, ACL_Data_Packet_Length(2), SCO_Data_Packet_Length(1),
@@ -2656,34 +2901,34 @@ static int setup_controller(void)
         out("Read_Buffer_Size failed, assuming MTU 1021 / 7 packets");
     }
 
-    /* Enable a broad event mask so Inquiry/SSP/auth events are delivered. */
-    {
-        unsigned char mask[8] = {
-            0xFF, 0xFF, 0xFB, 0xFF, 0x07, 0xF8, 0xBF, 0x3D
-        };
-        if (!hci_cmd_cc(OP_SET_EVENT_MASK, mask, 8, r, sizeof r, &n) || r[0])
-            out("Set_Event_Mask failed (continuing)");
-        else
-            out("Set_Event_Mask: ok");
-    }
-
     p[0] = 1; /* SSP enabled */
     if (!hci_cmd_cc(OP_WRITE_SSP_MODE, p, 1, r, sizeof r, &n) || r[0])
         out("Write_Simple_Pairing_Mode failed (continuing)");
     else
         out("Write_Simple_Pairing_Mode: enabled");
 
-    p[0] = 1; /* Inquiry Result with RSSI */
+    /* CSR: inquiry mode 1 (RSSI results). Realtek and others: mode 2 (EIR).
+     * Mode 2 is accepted by some CSR clones that then emit no results. */
+    p[0] = is_csr ? 1 : 2;
     if (!hci_cmd_cc(OP_WRITE_INQUIRY_MODE, p, 1, r, sizeof r, &n) || r[0])
         out("Write_Inquiry_Mode failed (continuing with standard results)");
     else
-        out("Write_Inquiry_Mode: RSSI");
+        out("Write_Inquiry_Mode: %s", is_csr ? "RSSI (CSR/PS4)" : "EIR");
 
     put16(p, PAGE_TIMEOUT);
     if (!hci_cmd_cc(OP_WRITE_PAGE_TIMEOUT, p, 2, r, sizeof r, &n) || r[0])
         out("Write_Page_Timeout failed (continuing)");
     else
         out("Write_Page_Timeout: 0x%04x (%.2f s)", PAGE_TIMEOUT, PAGE_TIMEOUT * 0.000625);
+
+    /* Same COD as PS5 HearBridge: Audio/Video major, unclassified minor.
+     * Sony earbuds often only open HFP (battery) when the remote looks like
+     * an A/V gateway rather than a plain computer dongle. */
+    p[0] = 0x00; p[1] = 0x04; p[2] = 0x00;
+    if (!hci_cmd_cc(OP_WRITE_CLASS_OF_DEV, p, 3, r, sizeof r, &n) || r[0])
+        out("Write_Class_Of_Device failed (continuing)");
+    else
+        out("Write_Class_Of_Device: 0x000400 (Audio/Video)");
 
     memset(p, 0, 248);
     snprintf((char *)p, 248, "HearBridge PS4");
@@ -3085,19 +3330,34 @@ static int sbc_state_from_ie(hb_sbc_state *st, const unsigned char ie[4])
 /* Pick one value from each field of the peer's SBC capabilities that we
  * also support: 48 kHz (else 44.1), joint stereo (else stereo), 16 blocks,
  * 8 subbands, loudness (else SNR), bitpool up to 53. */
-static int choose_sbc_config(const unsigned char cap[4], unsigned char cfg[4])
+static int choose_sbc_config(const unsigned char cap[4], unsigned char cfg[4], int pref)
 {
     unsigned char a = cap[0], b = cap[1];
     unsigned lo = cap[2], hi = cap[3];
-    cfg[0] = (a & 0x10) ? 0x10 : (a & 0x20) ? 0x20 : 0;
-    if (!cfg[0]) return 0;
-    cfg[0] |= (a & 0x01) ? 0x01 : (a & 0x02) ? 0x02 : 0;
-    if (!(cfg[0] & 0x0F)) return 0;
+    unsigned ceil;
+    /* pref: 0 Auto, 1 SBC, 2 SBC HQ, 3 SBC-XQ. HQ is joint/stereo with a
+     * higher bitpool; XQ is dual channel. Both only if the sink advertised
+     * them (checked by the caller via codec_avail); fall back to plain SBC. */
+    int xq = pref == 3 && (a & 0x04) && cap[3] >= 35;
+    int hq = pref == 2 && cap[3] > 53 && (a & 0x03);
+    if (xq) {
+        cfg[0] = (a & 0x10) ? 0x10 : (a & 0x20) ? 0x20 : 0;
+        if (!cfg[0]) return 0;
+        cfg[0] |= 0x04;                               /* dual channel */
+    } else {
+        cfg[0] = (a & 0x10) ? 0x10 : (a & 0x20) ? 0x20 : 0;
+        if (!cfg[0]) return 0;
+        cfg[0] |= (a & 0x01) ? 0x01 : (a & 0x02) ? 0x02 : 0;
+        if (!(cfg[0] & 0x0F)) return 0;
+    }
     cfg[1] = (b & 0x10) ? 0x10 : (b & 0x20) ? 0x20 : (b & 0x40) ? 0x40 : 0x80;
     cfg[1] |= (b & 0x04) ? 0x04 : 0x08;
     cfg[1] |= (b & 0x01) ? 0x01 : 0x02;
     if (lo < SBC_MIN_BP) lo = SBC_MIN_BP;
-    if (hi > SBC_MAX_BP) hi = SBC_MAX_BP;
+    /* Ceiling by the chosen codec. Plain SBC stays at the CSR8510 + 2.4 GHz
+     * coexistence cap; HQ and XQ climb higher when the headset allows it. */
+    ceil = xq ? 38u : hq ? 53u : (unsigned)SBC_MAX_BP;
+    if (hi > ceil) hi = ceil;
     if (hi < lo) return 0;
     cfg[2] = (unsigned char)lo;
     cfg[3] = (unsigned char)hi;
@@ -3187,6 +3447,15 @@ static int stream_pcm(struct chan *m)
             port != PCM_UDP_PORT ? " - fallback port, the tap follows " PCM_PORT_FILE : "");
     }
     pcm_udp_set_out_rate(fs);
+    /* Jitter-buffer target from the UI latency control. Auto keeps the
+     * adaptive default; a manual value really changes the ring target. */
+    {
+        int la = ui_get_lat_auto();
+        if (!la) pcm_udp_set_target_ms(ui_get_lat_ms());
+        else     pcm_udp_set_target_ms(70);
+        ui_set_lat_auto_ms(la ? pcm_udp_target_ms() : 0);
+        out("stream: jitter target %d ms (%s)", pcm_udp_target_ms(), la ? "auto" : "manual");
+    }
     out("stream: listening for PCM on UDP 127.0.0.1:%d (send \"stop\" to exit)", pcm_udp_port());
     g_session_streamed = 1;
     set_state("streaming", "HearBridge: streaming to headphones", 1);
@@ -3372,11 +3641,38 @@ static int stream_pcm(struct chan *m)
         }
         if (now_us() >= next_ui) {
             char cn[32];
-            snprintf(cn, sizeof cn, "SBC %s", st.mode == HB_SBC_JOINT ? "joint stereo" :
-                     st.mode == HB_SBC_STEREO ? "stereo" : "mono");
+            /* Name the live codec so the page's codec row can highlight it:
+             * dual channel is SBC-XQ, a ceiling above plain SBC is SBC HQ. */
+            const char *cname = st.mode == HB_SBC_DUAL ? "SBC-XQ" :
+                                bp_max > SBC_MAX_BP ? "SBC HQ" : "SBC";
+            snprintf(cn, sizeof cn, "%s", cname);
             ui_set_stream(cn, fs, st.bitpool, bp_max, pcm_udp_buffered() * 1000 / 48000,
                           G.acl_media_drops, resyncs);
+            {
+                float pk = 0.f, opk = 0.f;
+                int i, n = got > 0 ? got * (nch > 0 ? nch : 2) : 0;
+                for (i = 0; i < n; i++) {
+                    float a = (float)pcm[i];
+                    if (a < 0) a = -a;
+                    a /= 32768.f;
+                    if (a > pk) pk = a;
+                }
+                opk = pk;
+                ui_set_levels(pkts, frames_sent, pk, opk,
+                              pcm_udp_buffered(), fpp);
+                ui_set_avrcp_flags(avrcp_avail() ? 1 : 0,
+                                   AVR.remote_abs ? 1 : 0,
+                                   (AVR.notify_label >= 0 || AVR.ct_registered) ? 1 : 0,
+                                   AVR.sink_renders ? 1 : 0);
+            }
             ui_set_hs_volume(avrcp_avail(), avrcp_avail() ? AVR.volume : -1);
+            /* Only push a fresh reading. Never clear here: a brief HFP/AVRCP
+             * gap (codec reconnect, device switch in progress) used to flash
+             * "Not shown". ui_set_device clears when the peer address changes. */
+            if (HFP.battery >= 0)
+                ui_set_battery(-2, HFP.battery); /* -2 = HFP percent (no AVRCP level) */
+            else if (avrcp_avail() && AVR.battery >= 0)
+                ui_set_battery(AVR.battery, avrcp_battery_level(AVR.battery));
             next_ui = now_us() + 1000000ull;
         }
         /* If SBC is mono, downmix; if stereo/joint, pcm is already interleaved. */
@@ -3461,6 +3757,11 @@ static int stream_pcm(struct chan *m)
     pcm_udp_close();
     ui_set_streaming(0);
     ui_set_hs_volume(0, -1);
+    if (drop_is_away(g_end_reason) || drop_is_away(G.disc_reason)) {
+        /* Drop the "still linked" UI right away (case / power-off). */
+        ui_set_device(NULL, NULL);
+        ui_set_battery(-1, -1);
+    }
     say("Stream: %ld SBC frames in %ld packets, %.1f s, silent=%ld, stalls=%d%s",
         frames_sent, pkts, (double)(now_us() - t0) / 1e6, silent_frames, G.acl_stalls,
         stop ? " (stop)" : "");
@@ -3511,21 +3812,37 @@ static int run_stream(void)
             if (msg == AV_MSG_ACCEPT) hexline("avdtp: sink caps (no SBC)", rsp, len);
             if (!AV.configured) { say("FAIL: sink seid %d SBC capabilities", snk); return 0; }
         } else if (!AV.configured) {
+            int avail;
             out("avdtp: sink SBC caps %02x %02x bitpool %u-%u", cap[0], cap[1], cap[2], cap[3]);
-            if (!choose_sbc_config(cap, cfg)) { say("FAIL: no common SBC configuration"); return 0; }
-            body[0] = (unsigned char)(snk << 2);
-            body[1] = (unsigned char)(LOCAL_SEID << 2);
-            body[2] = 0x01; body[3] = 0x00;
-            body[4] = 0x07; body[5] = 0x06; body[6] = 0x00; body[7] = 0x00;
-            memcpy(body + 8, cfg, 4);
-            msg = avdtp_cmd(AV_SET_CONFIG, body, 12, rsp, (int)sizeof rsp, &len, 0);
-            if (msg == AV_MSG_ACCEPT && !AV.configured) {
-                AV.configured = 1;
-                AV.remote_seid = snk;
-                memcpy(AV.sbc_ie, cfg, 4);
-            } else if (!AV.configured) {
-                say("FAIL: SET_CONFIGURATION refused");
-                return 0;
+            /* UI codec chips: bit1=SBC, bit2=HQ, bit3=XQ (same as PS5). */
+            avail = 1 << 1;
+            if (cap[3] > 53 && (cap[0] & 0x03)) avail |= 1 << 2;
+            if ((cap[0] & 0x04) && cap[3] >= 35) avail |= 1 << 3;
+            ui_set_codec_caps(avail);
+            {
+                int pref = ui_get_codec_pref();
+                if (!choose_sbc_config(cap, cfg, pref)) { say("FAIL: no common SBC configuration"); return 0; }
+                body[0] = (unsigned char)(snk << 2);
+                body[1] = (unsigned char)(LOCAL_SEID << 2);
+                body[2] = 0x01; body[3] = 0x00;
+                body[4] = 0x07; body[5] = 0x06; body[6] = 0x00; body[7] = 0x00;
+                memcpy(body + 8, cfg, 4);
+                msg = avdtp_cmd(AV_SET_CONFIG, body, 12, rsp, (int)sizeof rsp, &len, 0);
+                /* Headset advertised HQ/XQ but refused the config: fall back to plain SBC. */
+                if (msg != AV_MSG_ACCEPT && !AV.configured && pref >= 2) {
+                    out("avdtp: pref %d refused, retrying plain SBC", pref);
+                    if (!choose_sbc_config(cap, cfg, 1)) { say("FAIL: no common SBC configuration"); return 0; }
+                    memcpy(body + 8, cfg, 4);
+                    msg = avdtp_cmd(AV_SET_CONFIG, body, 12, rsp, (int)sizeof rsp, &len, 0);
+                }
+                if (msg == AV_MSG_ACCEPT && !AV.configured) {
+                    AV.configured = 1;
+                    AV.remote_seid = snk;
+                    memcpy(AV.sbc_ie, cfg, 4);
+                } else if (!AV.configured) {
+                    say("FAIL: SET_CONFIGURATION refused");
+                    return 0;
+                }
             }
         }
     }
@@ -3614,6 +3931,14 @@ static void teardown(void)
 }
 
 /* ---- main / daemon ------------------------------------------------------- */
+
+static void hb_crumb(const char *s)
+{
+    int fd = open("/data/hearbridge/crumb.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) fd = open("/user/data/hearbridge/crumb.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd < 0) fd = open("/data/crumb.txt", O_WRONLY | O_CREAT | O_APPEND, 0666);
+    if (fd >= 0) { write(fd, s, strlen(s)); write(fd, "\n", 1); fsync(fd); close(fd); }
+}
 
 static void ensure_log_dir(void)
 {
@@ -3795,8 +4120,10 @@ static void quiet_listen(void)
 {
     enable_page_scan();
     G.accept_in = 1;
-    set_state("listening", NULL, 0);
-    out("daemon: page window used up, quiet now: listening only (page scan on), no more paging "
+    /* Same as PS5 idle: not "listening" (that read as still linked). Page scan
+     * stays on so a saved headset can call when it leaves the case. */
+    set_state("disconnected", NULL, 0);
+    out("daemon: page window used up, quiet now: disconnected, page scan on, no more paging "
         "until Reconnect, a scan or a new device is picked");
     while (!G.connected && !G.transport_dead && !G.user_abort && !G.stop_requested && !g_have_pending)
         pump_once();
@@ -3855,14 +4182,26 @@ static int connect_loop(struct dev *pick)
  * SES_RETRY. */
 static int session(void)
 {
-    usb_dev **list = NULL, *target = NULL;
+    usb_dev **list = NULL, *target = NULL, *first_bt = NULL;
     int count, i, rc, detached = 0, claimed = 0, stopped = 0, idle = 0, torn = 0, repeat;
+    unsigned tvid = 0, tpid = 0, fvid = 0, fpid = 0;
+    char seen[96];
+    char usb_n[96];
+    char want_id[16];
+    struct ui_adapter ads[HB_AD_MAX];
+    int n_ad = 0, sel;
     struct dev *pick;
     struct saved_dev last_after_scan;
 
+    seen[0] = 0;
+    usb_n[0] = 0;
+    want_id[0] = 0;
+    sel = hb_adapter_selection(want_id, (int)sizeof want_id);
     memset(&G, 0, sizeof G);
     memset(&AV, 0, sizeof AV);
     avrcp_init(&AVR, g_hs_vol >= 0 ? g_hs_vol : 127);
+    hfp_init(&HFP, hfp_tx, NULL, hfp_say);
+    g_hfp_scid = 0;
     AVR.seek_vol = 0;           /* next / previous stay track keys */
     ui_set_hs_volume(0, -1);
     G.next_cid = 0x0040;
@@ -3887,24 +4226,96 @@ static int session(void)
         struct usb_dev_desc d;
         memset(&d, 0, sizeof d);
         rc = U.GetDeviceDescriptor(list[i], &d);
+        if (rc >= 0) {
+            if (!usb_n[0])
+                snprintf(usb_n, sizeof usb_n, "%04X:%04X", d.idVendor, d.idProduct);
+            else if (strlen(usb_n) < sizeof usb_n - 12) {
+                char one[12];
+                snprintf(one, sizeof one, ", %04X:%04X", d.idVendor, d.idProduct);
+                strncat(usb_n, one, sizeof usb_n - strlen(usb_n) - 1);
+            }
+        }
         if (!repeat)
-            out("  [%d] bus %d addr %d  %04X:%04X class %02x  (desc rc %d)", i,
+            out("  [%d] bus %d addr %d  %04X:%04X class %02x/%02x/%02x  (desc rc %d)%s", i,
                 U.GetBusNumber ? U.GetBusNumber(list[i]) : -1,
                 U.GetDeviceAddress ? U.GetDeviceAddress(list[i]) : -1,
-                d.idVendor, d.idProduct, d.bDeviceClass, rc);
-        if (rc >= 0 && d.idVendor == TARGET_VID && d.idProduct == TARGET_PID && !target)
-            target = list[i];
+                d.idVendor, d.idProduct, d.bDeviceClass, d.bDeviceSubClass, d.bDeviceProtocol, rc,
+                (rc >= 0 && usb_stick_ok(&d)) ? "  [bt]" : "");
+        if (rc >= 0 && usb_stick_ok(&d)) {
+            char id[12], lab[40];
+            hb_adapter_id_fmt(d.idVendor, d.idProduct, id, (int)sizeof id);
+            btchip_describe((int)d.idVendor, (int)d.idProduct, lab, (int)sizeof lab);
+            if (n_ad < HB_AD_MAX) {
+                snprintf(ads[n_ad].id, sizeof ads[n_ad].id, "%s", id);
+                snprintf(ads[n_ad].label, sizeof ads[n_ad].label, "%s", lab[0] ? lab : id);
+                ads[n_ad].in_use = 0;
+                n_ad++;
+            }
+            if (!seen[0])
+                snprintf(seen, sizeof seen, "%04X:%04X", d.idVendor, d.idProduct);
+            else if (strlen(seen) < sizeof seen - 12) {
+                char one[12];
+                snprintf(one, sizeof one, ", %04X:%04X", d.idVendor, d.idProduct);
+                strncat(seen, one, sizeof seen - strlen(seen) - 1);
+            }
+            /* Preference: exact VID:PID, else first stick (auto/usb). */
+            if (sel == HB_SEL_ID && want_id[0] && !strcmp(id, want_id)) {
+                target = list[i];
+                tvid = d.idVendor;
+                tpid = d.idProduct;
+            } else if (sel != HB_SEL_ID && !target) {
+                target = list[i];
+                tvid = d.idVendor;
+                tpid = d.idProduct;
+            }
+            if (!first_bt) {
+                first_bt = list[i];
+                fvid = d.idVendor;
+                fpid = d.idProduct;
+            }
+        }
+    }
+    /* Exact pref missing: fall back to first Bluetooth stick. */
+    if (!target && first_bt) {
+        target = first_bt;
+        tvid = fvid;
+        tpid = fpid;
+        if (sel == HB_SEL_ID)
+            out("daemon: preferred adapter %s not present, using %04X:%04X",
+                want_id, tvid, tpid);
+    }
+    if (n_ad) {
+        char cur[12];
+        int k;
+        hb_adapter_id_fmt(tvid, tpid, cur, (int)sizeof cur);
+        for (k = 0; k < n_ad; k++)
+            ads[k].in_use = !strcmp(ads[k].id, cur);
+        ui_set_adapters(ads, n_ad, target ? cur : "");
     }
 
     if (!target) {
-        if (!repeat) say("FAIL: adapter 0A12:0001 not found (%d USB devices seen)", count);
-        set_state("no_adapter", "HearBridge: Bluetooth adapter not found", 1);
+        if (!repeat) {
+            if (usb_n[0])
+                say("FAIL: no CSR8510 (0A12:0001) or Realtek RTL8761BU dongle (%d USB devices seen: %s)",
+                    count, usb_n);
+            else
+                say("FAIL: no CSR8510 (0A12:0001) or Realtek RTL8761BU dongle (%d USB devices seen)",
+                    count);
+        }
+        set_state("no_adapter",
+                  "HearBridge: plug in a CSR8510 or Realtek RTL8761BU USB dongle", 1);
         g_no_adapter++;
         goto finish;
     }
-    if (repeat) out("daemon: adapter 0A12:0001 is there again");
+    if (repeat) out("daemon: Bluetooth dongle %04X:%04X is there again", tvid, tpid);
     g_no_adapter = 0;
-    say("Found adapter 0A12:0001");
+    {
+        char label[64];
+        btchip_describe((int)tvid, (int)tpid, label, (int)sizeof label);
+        say("Found adapter %s", label[0] ? label : "USB HCI");
+        if (seen[0] && strchr(seen, ','))
+            out("daemon: other Bluetooth USB candidates: %s (using %04X:%04X)", seen, tvid, tpid);
+    }
     set_state("init", NULL, 0);
 
     rc = U.Open(target, &H);
@@ -4054,6 +4465,15 @@ static void apply_cmd(const struct ui_cmd *c)
         g_ui_stop = 1;
         say("Stop requested from the UI");
         break;
+    case UI_CMD_REOPEN: {
+        char pref[24];
+        hb_adapter_pref_word(pref, (int)sizeof pref);
+        g_idle = 0;
+        g_want = 0;
+        g_scan_req = 0;
+        say("Switching Bluetooth adapter (%s)", pref);
+        break;
+    }
     default:
         break;
     }
@@ -4106,8 +4526,8 @@ static int http_local(int port, const char *path, char *buf, int max)
     return got > 0;
 }
 
-/* Web UI: 8090, waiting up to ~10 s for an old instance to let go of it;
- * 8091 if it stays taken. */
+/* Web UI: 6767, waiting up to ~10 s for an old instance to let go of it;
+ * 6768 if it stays taken. */
 static void start_ui(void)
 {
     static const int ports[2] = { UI_PORT, UI_PORT_ALT };
@@ -4120,6 +4540,7 @@ static void start_ui(void)
             sceKernelUsleep(500000);
         }
         out("ui: bind port %d: %s (errno %d, %d tries)", ports[k], rc == 0 ? "ok" : "failed", rc, tries + (rc == 0));
+        { char cb[64]; snprintf(cb, sizeof cb, "UI:bind port %d rc=%d", ports[k], rc); hb_crumb(cb); }
         if (rc == 0) break;
         if (k == 0) {
             char st[256];
@@ -4132,26 +4553,33 @@ static void start_ui(void)
         return;
     }
     ui_local_ip(ip, sizeof ip);
+    { char cb[96]; snprintf(cb, sizeof cb, "UI:up http://%s:%d", ip, ui_port()); hb_crumb(cb); }
     out("ui: http://%s:%d", ip, ui_port());
     notify_now("HearBridge: open http://%s:%d", ip, ui_port());
 }
 
-int main(void)
+/* Daemon entry used by the BinLoader ELF and by the GoldHEN plugin. */
+int daemon_main(void)
 {
     static const int backoff_ms[] = { 300, 500, 1000, 2000, 3000 };   /* no throttling: the dongle is ours */
     const int nbackoff = (int)(sizeof backoff_ms / sizeof backoff_ms[0]);
     int attempt = 0, fail_idx = 0, rc, pair_notified = 0;
     long pair_since = -1, wait_ms;
 
+    hb_crumb("A:main-entry");
     ensure_log_dir();
+    hb_crumb("B:logdir");
     g_log = fopen(LOG_PATH, "w");
     g_log_path = LOG_PATH;
     if (!g_log) {
         g_log = fopen(LOG_PATH_ALT, "w");
         g_log_path = LOG_PATH_ALT;
     }
+    hb_crumb("C:log-open");
     out("HearBridge PS4 daemon %s", PROBE_VERSION);
     if (!g_log) out("warning: could not open %s for writing", LOG_PATH);
+    hb_rtl_ensure_firmware();
+    hb_crumb("D:rtl-fw");
 
     notify_now("HearBridge PS4 %s", PROBE_VERSION);
     snprintf(g_notif_last, sizeof g_notif_last, "HearBridge PS4 %s", PROBE_VERSION);
@@ -4205,7 +4633,9 @@ int main(void)
             if (nk) out("devices: imported %d paired device(s) from link keys", nk);
         }
     }
+    hb_crumb("E:pre-start_ui");
     start_ui();
+    hb_crumb("F:post-start_ui");
     set_state("starting", NULL, 0);
     if (access(USER_DISC_PATH, F_OK) == 0) {
         g_user_disc = 1;
@@ -4249,8 +4679,16 @@ int main(void)
         if (g_session_streamed) {
             fail_idx = 0;
             hb_pager_after_stream(&g_pager, g_end_reason);
-            out("daemon: stream ended (reason %d): no paging, listening only until the headphones call "
-                "or Connect / Try now", g_end_reason);
+            if (drop_is_away(g_end_reason)) {
+                /* Case / power-off: leave the UI disconnected (not "listening"). */
+                ui_set_device(NULL, NULL);
+                ui_set_battery(-1, -1);
+                out("daemon: stream ended away (0x%02x): disconnected until the headphones call "
+                    "or Connect / Try now", g_end_reason & 0xff);
+            } else {
+                out("daemon: stream ended (reason %d): no paging, waiting until the headphones call "
+                    "or Connect / Try now", g_end_reason);
+            }
         }
 
         if (rc == SES_NEED_PAIRING) {
@@ -4281,7 +4719,10 @@ int main(void)
                  * 30 s. A command from the page ends the wait at once. */
                 wait_ms = g_no_adapter < 4 ? 3000 : g_no_adapter < 8 ? 10000 : 30000;
             } else if (g_session_streamed) {
-                set_state("listening", "HearBridge: headphones disconnected", 1);
+                if (drop_is_away(g_end_reason))
+                    set_state("disconnected", "HearBridge: headphones turned off", 1);
+                else
+                    set_state("disconnected", "HearBridge: headphones disconnected", 1);
             } else {
                 set_state("reconnect_wait", NULL, 1);
             }
@@ -4301,3 +4742,10 @@ int main(void)
     if (g_log) fclose(g_log);
     return 0;
 }
+
+#if !defined(HEARBRIDGE_PLUGIN)
+int main(void)
+{
+    return daemon_main();
+}
+#endif

@@ -3,13 +3,13 @@
  *
  * The audio work is done by the daemon payload; this app only makes sure it
  * runs and shows its web UI:
- *   1. asks /api/status on 127.0.0.1:8090 and :8091 whether a daemon with
+ *   1. asks /api/status on 127.0.0.1:6767 and :6768 whether a daemon with
  *      the web UI is running (state not "stopped"), and which version;
  *   2. if none answers, or it is older than the daemon bundled in this
  *      package, sends /app0/hearbridge_ps4_payload.elf to the GoldHEN
  *      BinLoader on 127.0.0.1:9090 (the new daemon takes over any running
  *      instance by itself) and waits for the UI to answer;
- *   3. shows a message with the page address (http://<console>:8090 for
+ *   3. shows a message with the page address (http://<console>:6767 for
  *      a phone or PC) and finishes, no browser is opened. Only when
  *      /data/hearbridge/open_browser exists it opens the PS4 Browser.
  * Before that it installs the game audio plugin (install.c): copies
@@ -29,6 +29,8 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <dirent.h>
+#include <errno.h>
 
 #include <orbis/CommonDialog.h>
 #include <orbis/MsgDialog.h>
@@ -40,9 +42,266 @@
 
 #include "addr.h"
 #include "install.h"
+#include "../src/daemon_main.h"
+
+static void lg(const char *fmt, ...);
+
+/* In-process daemon when BinLoader accepts the ELF but never runs it (e.g. 14.02). */
+static OrbisPthread g_daemon_thr;
+static volatile int g_daemon_inplace;
+
+static void *daemon_thr(void *arg)
+{
+    (void)arg;
+    lg("inplace: daemon_main start");
+    (void)daemon_main();
+    lg("inplace: daemon_main returned");
+    g_daemon_inplace = 0;
+    return NULL;
+}
+
+static int start_daemon_inplace(void)
+{
+    int rc;
+    if (g_daemon_inplace)
+        return 0;
+    g_daemon_inplace = 1;
+    rc = scePthreadCreate(&g_daemon_thr, 0, daemon_thr, 0, "hb_daemon");
+    if (rc != 0) {
+        g_daemon_inplace = 0;
+        lg("inplace: scePthreadCreate failed 0x%08x", (unsigned)rc);
+        return -1;
+    }
+    lg("inplace: daemon thread created");
+    return 0;
+}
+
+/* GoldHEN syscall 500: load a PRX into SceShellUI so the daemon survives
+ * when this launcher tile is closed (BinLoader is broken on some firmwares).
+ * SceShellUI is jailed: /data is not visible there, so we also copy the PRX
+ * into its sandbox and load via the in-jail path (/system_tmp/... etc.). */
+#define GOLDHEN_SDK_CMD_PROCESS_PRX_LOAD 6
+#define DAEMON_PRX_NAME "hearbridge_daemon.prx"
+#define DAEMON_PRX_APP0 "/app0/hearbridge_daemon.prx"
+#define DAEMON_PRX_GOLDHEN "/data/GoldHEN/plugins/hearbridge_daemon.prx"
+#define SHELLUI_NAME "SceShellUI"
+#define SHELLUI_TITLE "NPXS20001"
+#define SANDBOX_ROOT "/mnt/sandbox"
+#define LOCK_PATH "/data/hearbridge/daemon.lock"
+#define LOCK_PATH_ALT "/user/data/hearbridge/daemon.lock"
+
+struct proc_prx_load {
+    char process_name[32];
+    char prx_path[100];
+    uint64_t res;
+} __attribute__((packed));
+
+static uint64_t goldhen_raw(uint64_t cmd, void *data, int *carry)
+{
+    register uint64_t rax __asm__("rax") = 500;
+    register uint64_t rdi __asm__("rdi") = cmd;
+    register uint64_t rsi __asm__("rsi") = (uint64_t)(uintptr_t)data;
+    uint8_t cf;
+    __asm__ volatile("syscall\n\tsetc %3"
+                     : "+r"(rax), "+r"(rdi), "+r"(rsi), "=r"(cf)
+                     :
+                     : "rcx", "rdx", "r8", "r9", "r10", "r11", "memory", "cc");
+    if (carry) *carry = cf;
+    return rax;
+}
+
+static int copy_file(const char *src, const char *dst)
+{
+    FILE *in, *out;
+    char buf[8192];
+    size_t n;
+    in = fopen(src, "rb");
+    if (!in) return -1;
+    out = fopen(dst, "wb");
+    if (!out) {
+        fclose(in);
+        return -1;
+    }
+    while ((n = fread(buf, 1, sizeof buf, in)) > 0) {
+        if (fwrite(buf, 1, n, out) != n) {
+            fclose(in); fclose(out);
+            return -1;
+        }
+    }
+    fclose(in);
+    fflush(out);
+    fsync(fileno(out));
+    fclose(out);
+    return 0;
+}
+
+static int is_dir(const char *p)
+{
+    struct stat st;
+    return stat(p, &st) == 0 && S_ISDIR(st.st_mode);
+}
+
+static int prx_path_unreachable(int64_t res)
+{
+    uint32_t r = (uint32_t)res;
+    return r == 0x80020002u || r == 0x80020001u ||
+           r == 0x8002000du || r == 0x80020014u;
+}
+
+static int find_shellui_sandbox(char *out, size_t out_sz)
+{
+    DIR *d;
+    struct dirent *e;
+    char best[64] = "";
+    static const char *const known[] = {
+        SANDBOX_ROOT "/" SHELLUI_TITLE "_000",
+        SANDBOX_ROOT "/" SHELLUI_TITLE "_001",
+        NULL
+    };
+    int i;
+
+    /* HearBridge's own jail often cannot opendir(/mnt/sandbox); still try
+     * the well-known ShellUI roots (FTP can see them from outside). */
+    for (i = 0; known[i]; i++) {
+        if (is_dir(known[i])) {
+            lg("inject: sandbox known %s", known[i]);
+            snprintf(out, out_sz, "%s", known[i]);
+            return 0;
+        }
+        lg("inject: known missing %s", known[i]);
+    }
+
+    d = opendir(SANDBOX_ROOT);
+    if (!d) {
+        lg("inject: cannot open %s errno=%d", SANDBOX_ROOT, errno);
+        return -1;
+    }
+    while ((e = readdir(d)) != NULL) {
+        if (strncmp(e->d_name, SHELLUI_TITLE "_", sizeof(SHELLUI_TITLE)) != 0)
+            continue;
+        lg("inject: sandbox found %s/%s", SANDBOX_ROOT, e->d_name);
+        if (best[0] == '\0' || strcmp(e->d_name, SHELLUI_TITLE "_000") == 0)
+            snprintf(best, sizeof best, "%s", e->d_name);
+    }
+    closedir(d);
+    if (best[0] == '\0')
+        return -1;
+    snprintf(out, out_sz, "%s/%s", SANDBOX_ROOT, best);
+    return 0;
+}
+
+static int64_t load_into_shellui(const char *path)
+{
+    struct proc_prx_load args;
+    int cf = 0;
+    uint64_t rax;
+
+    memset(&args, 0, sizeof args);
+    strncpy(args.process_name, SHELLUI_NAME, sizeof args.process_name - 1);
+    strncpy(args.prx_path, path, sizeof args.prx_path - 1);
+    rax = goldhen_raw(GOLDHEN_SDK_CMD_PROCESS_PRX_LOAD, &args, &cf);
+    lg("inject: PROCESS_PRX_LOAD path=%s rax=0x%llx carry=%d res=0x%llx",
+       path, (unsigned long long)rax, cf, (unsigned long long)args.res);
+    return (int64_t)args.res;
+}
+
+/* 0 = loaded into ShellUI, -1 = failed. Tries GoldHEN plugins dir, then
+ * paths inside the ShellUI jail (same strategy as inject_common.h). */
+static int inject_daemon_shellui(void)
+{
+    static const char *const sbx_sub[] = { "/system_tmp", "/tmp", "" };
+    char sbx[96];
+    char real[192], view[192];
+    int64_t res;
+    unsigned i;
+
+    /* Stale lock from a killed in-app daemon would make the plugin skip. */
+    unlink(LOCK_PATH);
+    unlink(LOCK_PATH_ALT);
+
+    /* Prefer fopen over access(): on PS4 access(R_OK) can fail for /app0
+     * files that fopen can still read (seen with hearbridge_daemon.prx). */
+    {
+        FILE *probe = fopen(DAEMON_PRX_APP0, "rb");
+        if (!probe) {
+            lg("inject: no %s (fopen failed errno=%d)", DAEMON_PRX_APP0, errno);
+            return -1;
+        }
+        fclose(probe);
+        lg("inject: found %s", DAEMON_PRX_APP0);
+    }
+
+    mkdir("/data/GoldHEN", 0777);
+    mkdir("/data/GoldHEN/plugins", 0777);
+    if (copy_file(DAEMON_PRX_APP0, DAEMON_PRX_GOLDHEN) == 0) {
+        lg("inject: try GoldHEN path %s", DAEMON_PRX_GOLDHEN);
+        res = load_into_shellui(DAEMON_PRX_GOLDHEN);
+        if (res >= 0)
+            return 0;
+        if (!prx_path_unreachable(res)) {
+            lg("inject: GoldHEN path load failed hard");
+            return -1;
+        }
+    } else {
+        lg("inject: cannot write %s", DAEMON_PRX_GOLDHEN);
+        res = (int64_t)(int32_t)0x80020002u;
+    }
+
+    /* Even if we cannot write into ShellUI's jail from this app, try loading
+     * well-known in-jail paths (file may have been planted via FTP/install). */
+    {
+        static const char *const views[] = {
+            "/system_tmp/" DAEMON_PRX_NAME,
+            "/tmp/" DAEMON_PRX_NAME,
+            "/" DAEMON_PRX_NAME,
+            NULL
+        };
+        int vi;
+        for (vi = 0; views[vi]; vi++) {
+            lg("inject: try in-jail path %s", views[vi]);
+            res = load_into_shellui(views[vi]);
+            if (res >= 0)
+                return 0;
+            if (!prx_path_unreachable(res))
+                return -1;
+        }
+    }
+
+    if (find_shellui_sandbox(sbx, sizeof sbx) != 0) {
+        lg("inject: no ShellUI sandbox under %s", SANDBOX_ROOT);
+        return -1;
+    }
+    for (i = 0; i < sizeof sbx_sub / sizeof sbx_sub[0]; i++) {
+        char dir[160];
+        snprintf(dir, sizeof dir, "%s%s", sbx, sbx_sub[i]);
+        if (!is_dir(dir)) {
+            lg("inject: skip missing %s", dir);
+            continue;
+        }
+        snprintf(real, sizeof real, "%s/%s", dir, DAEMON_PRX_NAME);
+        if (sbx_sub[i][0] == '\0')
+            snprintf(view, sizeof view, "/%s", DAEMON_PRX_NAME);
+        else
+            snprintf(view, sizeof view, "%s/%s", sbx_sub[i], DAEMON_PRX_NAME);
+        if (copy_file(DAEMON_PRX_APP0, real) != 0) {
+            lg("inject: write %s failed errno=%d", real, errno);
+            continue;
+        }
+        lg("inject: try sandbox %s (ShellUI sees %s)", real, view);
+        res = load_into_shellui(view);
+        if (res >= 0)
+            return 0;
+        unlink(real);
+        if (!prx_path_unreachable(res))
+            return -1;
+    }
+    lg("inject: all ShellUI paths failed");
+    return -1;
+}
+
 
 #ifndef LAUNCHER_VERSION
-#define LAUNCHER_VERSION "1.0.0"
+#define LAUNCHER_VERSION "1.1.0"
 #endif
 #ifndef DAEMON_VERSION
 #define DAEMON_VERSION "0.0.0"
@@ -59,7 +318,8 @@
 #define UI_PORT      8090
 #define UI_PORT_ALT  8091   /* when 8090 stays taken */
 #define LOADER_PORT  9090
-#define START_WAIT_MS 40000   /* takeover up to ~6 s + port wait up to ~13 s */
+#define START_WAIT_MS 8000    /* inject/inplace UI wait */
+#define BINLOADER_WAIT_MS 3000 /* 14.02 accepts ELF but does not run it */
 
 /* SceWebBrowserDialogParam (328 bytes); OpenOrbis has no types for it. */
 typedef struct {
@@ -542,11 +802,11 @@ int main(void)
     note[0] = 0;
     if (ir.plugin < 0 || ir.plugins_ini < 0)
         snprintf(note + strlen(note), sizeof note - strlen(note),
-                 "The game audio plugin could not be installed (details in "
+                 "HearBridge plugins could not be installed (details in "
                  "/data/hearbridge/launcher.log). Headphone audio from the system still works.\n\n");
     else if (ir.plugin > 0 || ir.plugins_ini > 0)
         snprintf(note + strlen(note), sizeof note - strlen(note),
-                 "Game audio plugin installed. Game sound reaches the headphones in games "
+                 "Plugins installed (tap+boot+daemon). Open a game for headphones audio. "
                  "you start from now on.\n\n");
     if (ir.loader > 0)
         snprintf(note + strlen(note), sizeof note - strlen(note),
@@ -565,18 +825,19 @@ int main(void)
         prog = progress_open(up ? "Updating HearBridge..." : "Starting HearBridge...");
         rc = send_daemon();
         if (rc == 0) {
-            /* An updated daemon replaces the old one: wait for the new version. */
+            /* Short wait: on 14.02 BinLoader never runs the ELF. */
             t0 = now_ms();
-            t_end = t0 + START_WAIT_MS;
+            t_end = t0 + BINLOADER_WAIT_MS;
             up = 0;
             while (now_ms() < t_end) {
                 if (prog)
-                    sceMsgDialogProgressBarSetValue(0, (uint32_t)((now_ms() - t0) * 100 / START_WAIT_MS));
+                    sceMsgDialogProgressBarSetValue(
+                        0, (uint32_t)((now_ms() - t0) * 100 / BINLOADER_WAIT_MS));
                 if (daemon_status(ver, sizeof ver, build, sizeof build, &port) && daemon_current(ver, build)) {
                     up = 1;
                     break;
                 }
-                usleep(500000);
+                usleep(200000);
             }
             lg("daemon UI after start: %s %s port %d (%ld ms)", up ? "up" : "no answer", ver, port,
                now_ms() - t0);
@@ -584,15 +845,56 @@ int main(void)
         progress_close(prog);
         if (rc == -1)
             message("HearBridge could not read its daemon from the package. Reinstall the HearBridge package.");
-        else if (rc == -2)
-            message("HearBridge could not start its daemon.\n\nTurn on the BinLoader server in "
-                    "GoldHEN Settings (port 9090), then open HearBridge again.");
-        else if (rc == -3)
-            message("Sending the HearBridge daemon to BinLoader failed. Open HearBridge again.");
-        else if (!up)
-            message("HearBridge was started but its page did not answer yet.\n\n"
-                    "Wait a few seconds, then open HearBridge again. "
-                    "Details: /data/hearbridge/launcher.log");
+        else if (!up) {
+            /* BinLoader did not run the ELF (e.g. firmware 14.02). Prefer
+             * injecting the daemon PRX into SceShellUI so it survives games;
+             * fall back to an in-process thread in this tile. */
+            int injected = 0;
+            lg("fallback: BinLoader path did not bring UI up (rc=%d)", rc);
+            prog = progress_open("Starting HearBridge (ShellUI)...");
+            if (inject_daemon_shellui() == 0) {
+                t0 = now_ms();
+                t_end = t0 + START_WAIT_MS;
+                while (now_ms() < t_end) {
+                    if (prog)
+                        sceMsgDialogProgressBarSetValue(0, (uint32_t)((now_ms() - t0) * 100 / START_WAIT_MS));
+                    /* Accept any live daemon UI (build may be "dev" in early builds). */
+                    if (daemon_status(ver, sizeof ver, build, sizeof build, &port)) {
+                        up = 1;
+                        injected = 1;
+                        break;
+                    }
+                    usleep(200000);
+                }
+                lg("inject: daemon UI %s %s port %d (%ld ms)", up ? "up" : "no answer", ver, port,
+                   now_ms() - t0);
+            }
+            progress_close(prog);
+            if (!up) {
+                prog = progress_open("Starting HearBridge (in-app)...");
+                if (start_daemon_inplace() == 0) {
+                    t0 = now_ms();
+                    t_end = t0 + START_WAIT_MS;
+                    while (now_ms() < t_end) {
+                        if (prog)
+                            sceMsgDialogProgressBarSetValue(0, (uint32_t)((now_ms() - t0) * 100 / START_WAIT_MS));
+                        if (daemon_status(ver, sizeof ver, build, sizeof build, &port)) {
+                            up = 1;
+                            break;
+                        }
+                        usleep(200000);
+                    }
+                    lg("inplace: daemon UI %s %s port %d (%ld ms)", up ? "up" : "no answer", ver, port,
+                       now_ms() - t0);
+                }
+                progress_close(prog);
+            }
+            if (injected)
+                g_daemon_inplace = 0; /* ShellUI owns it; this tile can exit */
+            if (!up)
+                message("HearBridge could not start its daemon.\n\n"
+                        "Details: /data/hearbridge/launcher.log");
+        }
     }
     while (note[0] && note[strlen(note) - 1] == '\n') note[strlen(note) - 1] = 0;
     if (up) {
@@ -618,6 +920,20 @@ int main(void)
         message(note);
     }
 
+    if (g_daemon_inplace) {
+        /* Keep this process alive so the in-app daemon keeps running. Leaving
+         * the tile (or Circle on the address dialog) still ends us; until then
+         * headphones and the web UI stay up. */
+        lg("inplace: staying resident (daemon in this process)");
+        for (;;) {
+            if (!g_daemon_inplace) break;
+            usleep(1000000);
+            if (!daemon_status(ver, sizeof ver, build, sizeof build, &port)) {
+                lg("inplace: UI gone, exiting");
+                break;
+            }
+        }
+    }
     lg("launcher done");
     sceSystemServiceLoadExec("exit", NULL);
     return 0;
